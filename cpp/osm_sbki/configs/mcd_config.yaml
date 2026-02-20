@@ -1,0 +1,168 @@
+# MCD Dataset Configuration
+# Configuration for Multi-Class Dataset (MCD) semantic segmentation
+
+dataset_name: "mcd"
+dataset_root_path: "/media/donceykong/doncey_ssd_02/datasets/MCD"
+sequence: "kth_day_09"
+skip_frames: 10
+
+# Label definitions: raw_id -> label_name
+labels:
+  0: barrier
+  1: bike
+  2: building
+  3: chair
+  4: cliff
+  5: container
+  6: curb
+  7: fence
+  8: hydrant
+  9: infosign
+  10: lanemarking
+  11: noise
+  12: other
+  13: parkinglot
+  14: pedestrian
+  15: pole
+  16: road
+  17: shelter
+  18: sidewalk
+  19: stairs
+  20: structure-other
+  21: traffic-cone
+  22: traffic-sign
+  23: trashbin
+  24: treetrunk
+  25: vegetation
+  26: vehicle-dynamic
+  27: vehicle-other
+  28: vehicle-static
+
+colors:
+  "0": [128, 128, 128]  # barrier
+  "1": [119, 11, 32]    # bike
+  "2": [0, 100, 0]      # building
+  "3": [139, 69, 19]    # chair
+  "4": [101, 67, 33]    # cliff
+  "5": [160, 160, 160]  # container
+  "6": [244, 35, 232]   # curb
+  "7": [190, 153, 153]  # fence
+  "8": [255, 165, 0]    # hydrant
+  "9": [255, 255, 0]    # infosign
+  "10": [170, 255, 150] # lanemarking
+  "11": [0, 0, 0]       # noise
+  "12": [255, 255, 50]  # other
+  "13": [250, 170, 160] # parkinglot
+  "14": [220, 20, 60]   # pedestrian
+  "15": [153, 153, 153] # pole
+  "16": [128, 64, 128]  # road
+  "17": [0, 100, 0]     # shelter
+  "18": [244, 35, 232]  # sidewalk
+  "19": [128, 0, 128]   # stairs
+  "20": [0, 150, 255]   # structure-other
+  "21": [255, 69, 0]    # traffic-cone
+  "22": [0, 0, 255]     # traffic-sign
+  "23": [139, 0, 139]   # trashbin
+  "24": [0, 60, 135]    # treetrunk
+  "25": [107, 142, 35]  # vegetation
+  "26": [245, 150, 100] # vehicle-dynamic
+  "27": [51, 0, 51]     # vehicle-other
+  "28": [0, 0, 142]     # vehicle-static
+
+# Confusion matrix (8x6): rows=predicted classes, cols=prior classes
+# Prior cols: [roads, parking, sidewalks, vegetation, buildings, fences]
+confusion_matrix:
+  # 0: Roads (Strict trust)
+  - [0.90, 0.50, 0.10, 0.01, 0.00, 0.01]
+  
+  # 1: Parking (Allow on undefined, suppress on Buildings/Roads)
+  # Note: OSM often misses parking, but if it says 'Building', it's definitely NOT parking.
+  - [0.10, 0.80, 0.10, 0.05, 0.00, 0.05]
+  
+  # 2: Sidewalks (Allow near roads, suppress on Buildings)
+  - [0.10, 0.50, 0.80, 0.10, 0.00, 0.05]
+  
+  # 3: Vegetation (Relaxed - trees overhang everything)
+  # We allow vegetation on top of buildings (roof gardens) and roads (canopies)
+  - [0.20, 0.20, 0.20, 0.90, 0.20, 0.20]
+  
+  # 4: Buildings (Strict trust)
+  - [0.00, 0.00, 0.00, 0.05, 0.95, 0.01]
+  
+  # 5: Fences (Suppress on Roads/Buildings)
+  - [0.05, 0.10, 0.10, 0.50, 0.01, 0.90]
+  
+  # 6: Vehicles (Dynamic - Allow on Roads/Parking, Suppress on Buildings/Fences)
+  - [0.80, 0.80, 0.20, 0.05, 0.00, 0.01]
+  
+  # 7: Other (General fallback)
+  - [0.10, 0.10, 0.10, 0.10, 0.01, 0.10]
+
+# Mapping from raw label ID to confusion matrix row index
+label_to_matrix_idx:
+  16: 0  # road -> roads
+  10: 0  # lanemarking -> roads
+  13: 1  # parkinglot -> parking
+  18: 2  # sidewalk -> sidewalks
+  6: 2   # curb -> sidewalks
+  19: 2  # stairs -> sidewalks
+  4: 2   # cliff -> sidewalks
+  25: 3  # vegetation -> vegetation
+  24: 3  # treetrunk -> vegetation
+  2: 4   # building -> buildings
+  20: 4  # structure-other -> buildings
+  17: 4  # shelter -> buildings
+  7: 5   # fence -> fences
+  0: 5   # barrier -> fences
+  1: 6   # bike -> vehicles
+  14: 6  # pedestrian -> vehicles
+  26: 6  # vehicle-dynamic -> vehicles
+  27: 6  # vehicle-other -> vehicles
+  28: 6  # vehicle-static -> vehicles
+  15: 7  # pole -> other
+  22: 7  # traffic-sign -> other
+  9: 7   # infosign -> other
+  12: 7  # other -> other
+  3: 7   # chair -> other
+  5: 7   # container -> other
+  8: 7   # hydrant -> other
+  21: 7  # traffic-cone -> other
+  23: 7  # trashbin -> other
+  11: 7  # noise -> other
+
+# OSM XML coordinate projection parameters
+# Required for proper lat/lon -> world frame alignment when using .osm XML files.
+# osm_origin_lat/lon: GPS reference point (corresponds to the first LiDAR pose position)
+# osm_world_offset_x/y: world-frame position of that GPS reference point
+# These values are for the KTH campus MCD dataset.
+osm_origin_lat: 59.348268650
+osm_origin_lon: 18.073204280
+osm_world_offset_x: 0.0
+osm_world_offset_y: 0.0
+
+# OSM category mapping to prior class indices
+# Point features (poles, signs, barriers) map to existing prior classes
+osm_class_map:
+  roads: 0
+  parking: 1
+  sidewalks: 2
+  grasslands: 3
+  trees: 3
+  wood: 3
+  buildings: 4
+  fences: 5
+  poles: 5          # Point features - map to fences prior (vertical structures)
+  traffic_signs: 5  # Point features - map to fences prior (vertical structures)
+  barriers: 5       # Point features - map to fences prior
+
+# OSM categories (for both binary and XML loading)
+# Binary format expects this exact order; XML format uses these as keys
+osm_categories:
+  - buildings
+  - roads
+  - grasslands
+  - trees
+  - wood
+  - poles
+  - traffic_signs
+  - barriers

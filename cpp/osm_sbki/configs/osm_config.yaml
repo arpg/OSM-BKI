@@ -1,0 +1,14 @@
+# OSM parser configuration for osm_sbki/examples/visualize_osm.cpp
+
+osm_file: "/media/donceykong/doncey_ssd_02/datasets/MCD/kth.osm"
+
+# Category filters (mirrors BKISemanticMapping osmium filtering intent)
+include_buildings: true
+include_roads: true
+include_sidewalks: true
+include_parking: true
+include_fences: true
+include_stairs: true
+include_grasslands: true
+include_trees: true
+

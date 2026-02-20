@@ -1,0 +1,105 @@
+# SemanticKITTI Dataset Configuration
+# Configuration for SemanticKITTI semantic segmentation
+
+# Label definitions: raw_id -> label_name
+labels:
+  0: unlabeled
+  1: outlier
+  10: car
+  11: bicycle
+  13: bus
+  15: motorcycle
+  16: on-rails
+  18: truck
+  20: other-vehicle
+  30: person
+  31: bicyclist
+  32: motorcyclist
+  40: road
+  44: parking
+  48: sidewalk
+  49: other-ground
+  50: building
+  51: fence
+  52: other-structure
+  60: lane-marking
+  70: vegetation
+  71: trunk
+  72: terrain
+  80: pole
+  81: traffic-sign
+  99: other-object
+  252: moving-car
+  253: moving-bicyclist
+  254: moving-person
+  255: moving-motorcyclist
+  256: moving-on-rails
+  257: moving-bus
+  258: moving-truck
+  259: moving-other-vehicle
+
+# Confusion matrix (8x6): rows=predicted classes, cols=prior classes
+# Prior classes: [roads, parking, sidewalks, vegetation, buildings, fences]
+confusion_matrix:
+  - [0.85, 0.10, 0.05, 0.00, 0.00, 0.00]  # roads
+  - [0.10, 0.85, 0.05, 0.00, 0.00, 0.00]  # parking
+  - [0.05, 0.05, 0.80, 0.05, 0.05, 0.00]  # sidewalks
+  - [0.01, 0.01, 0.05, 0.90, 0.02, 0.01]  # vegetation
+  - [0.01, 0.01, 0.02, 0.05, 0.90, 0.01]  # buildings
+  - [0.00, 0.00, 0.01, 0.05, 0.10, 0.84]  # fences
+  - [0.40, 0.40, 0.05, 0.01, 0.01, 0.00]  # vehicles
+  - [0.15, 0.15, 0.50, 0.05, 0.05, 0.05]  # other
+
+# Mapping from raw label ID to confusion matrix row index
+label_to_matrix_idx:
+  40: 0   # road -> roads
+  60: 0   # lane-marking -> roads
+  44: 1   # parking -> parking
+  48: 2   # sidewalk -> sidewalks
+  49: 2   # other-ground -> sidewalks
+  72: 2   # terrain -> sidewalks
+  70: 3   # vegetation -> vegetation
+  71: 3   # trunk -> vegetation
+  50: 4   # building -> buildings
+  52: 4   # other-structure -> buildings
+  51: 5   # fence -> fences
+  10: 6   # car -> vehicles
+  11: 6   # bicycle -> vehicles
+  13: 6   # bus -> vehicles
+  15: 6   # motorcycle -> vehicles
+  16: 6   # on-rails -> vehicles
+  18: 6   # truck -> vehicles
+  20: 6   # other-vehicle -> vehicles
+  252: 6  # moving-car -> vehicles
+  253: 6  # moving-bicyclist -> vehicles
+  254: 6  # moving-person -> vehicles
+  255: 6  # moving-motorcyclist -> vehicles
+  256: 6  # moving-on-rails -> vehicles
+  257: 6  # moving-bus -> vehicles
+  258: 6  # moving-truck -> vehicles
+  259: 6  # moving-other-vehicle -> vehicles
+  30: 7   # person -> other
+  31: 7   # bicyclist -> other
+  32: 7   # motorcyclist -> other
+  80: 7   # pole -> other
+  81: 7   # traffic-sign -> other
+  99: 7   # other-object -> other
+
+# OSM category mapping to prior class indices
+osm_class_map:
+  roads: 0
+  parking: 1
+  sidewalks: 2
+  grasslands: 3
+  trees: 3
+  wood: 3
+  buildings: 4
+  fences: 5
+
+# OSM categories in binary file order
+osm_categories:
+  - buildings
+  - roads
+  - grasslands
+  - trees
+  - wood
