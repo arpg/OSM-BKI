@@ -10,6 +10,7 @@ option(osm_bki_ENABLE_WARNINGS "Enable compiler warnings" ON)
 # Use set(... CACHE BOOL ...) so that -Dosm_bki_BUILD_PCL_EXAMPLES=ON on the command line is applied even when reconfiguring (option() would keep the first cached value).
 set(osm_bki_BUILD_PCL_EXAMPLES OFF CACHE BOOL "Build PCL-based example program (visualize_map_osm)")
 set(OSMIUM_INCLUDE_DIR "" CACHE PATH "Path to libosmium include directory (e.g. /path/to/osmium/include; required for visualize_map_osm)")
+set(Boost_INCLUDE_DIR_MANUAL "" CACHE PATH "Override: path to Boost include (directory that contains boost/; set if PCL fails to find boost/mpl/assert.hpp)")
 
 message(STATUS "osm_bki_BUILD_PCL_EXAMPLES=${osm_bki_BUILD_PCL_EXAMPLES}")
 
@@ -42,7 +43,15 @@ endif()
 if(osm_bki_BUILD_PCL_EXAMPLES)
     message(STATUS "PCL example requested; looking for Boost, MPI, PCL, and libosmium...")
     # PCL requires Boost (e.g. boost/mpl/assert.hpp). Find it before PCL.
+    set(Boost_NO_BOOST_CMAKE ON)  # use FindBoost.cmake, not BoostConfig.cmake
     find_package(Boost 1.65 REQUIRED)
+    if(NOT Boost_INCLUDE_DIRS)
+        set(Boost_INCLUDE_DIRS ${Boost_INCLUDE_DIR})
+    endif()
+    if(Boost_INCLUDE_DIR_MANUAL)
+        set(Boost_INCLUDE_DIRS ${Boost_INCLUDE_DIR_MANUAL})
+        message(STATUS "Using manual Boost include: ${Boost_INCLUDE_DIR_MANUAL}")
+    endif()
     message(STATUS "Boost found: ${Boost_VERSION} at ${Boost_INCLUDE_DIRS}")
     find_package(MPI REQUIRED COMPONENTS C)
     find_package(PCL QUIET COMPONENTS common io visualization)
@@ -69,8 +78,11 @@ if(osm_bki_BUILD_PCL_EXAMPLES)
     if(PCL_FOUND)
         message(STATUS "Adding example: test_cbki (continuous mapping + PCL viz)")
         add_executable(test_cbki examples/test_cbki.cpp)
-        # Put Boost includes first so PCL headers can find boost/* when included
-        target_include_directories(test_cbki PRIVATE ${Boost_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS})
+        # PCL headers #include <boost/...>; Boost must be in include path before PCL
+        target_include_directories(test_cbki PRIVATE
+            ${Boost_INCLUDE_DIRS}
+            ${PCL_INCLUDE_DIRS}
+        )
         target_link_libraries(test_cbki PRIVATE osm_bki_core ${PCL_LIBRARIES})
         if(TARGET Boost::headers)
             target_link_libraries(test_cbki PRIVATE Boost::headers)
