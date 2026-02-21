@@ -1,0 +1,13 @@
+simple_node:
+  ros__parameters:
+    # Topics
+    input_topic: "/velodyne_points"
+    output_topic: "/bki/semantic_cloud"
+    
+    # BKI Settings
+    osm_path: "/path/to/your/map.osm"  # CHANGE THIS
+    config_path: "/path/to/your/config.yaml" # CHANGE THIS
+    resolution: 0.1
+    
+    # Mode
+    update_map: false  # Set to true to update map with incoming data
