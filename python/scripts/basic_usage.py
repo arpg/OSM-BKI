@@ -11,10 +11,12 @@ paths do not exist, the script falls back to ../example_data/mcd_scan.
 import sys
 from pathlib import Path
 
-# Ensure package root (python/) is on path so composite_bki_cpp is found when
-# running this script directly (e.g. python scripts/basic_usage.py)
+# Ensure composite_bki_cpp is found: prefer python/build/ (if present), then python/
 _script_dir = Path(__file__).resolve().parent
 _python_dir = _script_dir.parent
+_build_dir = _python_dir / "build"
+if _build_dir.is_dir() and str(_build_dir) not in sys.path:
+    sys.path.insert(0, str(_build_dir))
 if str(_python_dir) not in sys.path:
     sys.path.insert(0, str(_python_dir))
 
