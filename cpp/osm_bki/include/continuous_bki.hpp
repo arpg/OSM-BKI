@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <iostream>
 #include <numeric>
+#include <chrono>
+#include <atomic>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -119,9 +121,7 @@ public:
                   float alpha0 = 1.0f,
                   bool seed_osm_prior = false,
                   float osm_prior_strength = 0.0f,
-                  bool osm_fallback_in_infer = true,
-                  float lambda_min = 0.8f,
-                  float lambda_max = 0.99f);
+                  bool osm_fallback_in_infer = true);
 
     // --- Templated update logic to reduce duplication ---
     template <typename ValueType>
@@ -168,15 +168,8 @@ public:
                             const BlockKey& bk,
                             std::vector<float>& buf_m_i,
                             std::vector<float>& buf_p_super,
-                            std::vector<float>& buf_p_pred,
-                            int current_time) const;
+                            std::vector<float>& buf_p_pred) const;
     const Block* getBlockConst(const std::unordered_map<BlockKey, Block, BlockKeyHasher>& shard_map, const BlockKey& bk) const;
-
-    // Helper to apply lazy decay to a block
-    void applyLazyDecay(Block& blk, const BlockKey& bk, int current_time,
-                        std::vector<float>& buf_m_i,
-                        std::vector<float>& buf_p_super,
-                        std::vector<float>& buf_p_pred) const;
 
     // Prior seeding (Dirichlet base + optional OSM mapped prior)
     void initVoxelAlpha(Block& b, int lx, int ly, int lz, const Point3D& center,
@@ -196,6 +189,21 @@ public:
     float getSemanticKernel(int matrix_idx, const std::vector<float>& m_i,
                             std::vector<float>& buf_expected_obs) const;
     float computeSpatialKernel(float dist_sq) const;
+
+    // --- Profiling ---
+    struct ProfilingStats {
+        double raster_build_ms = 0.0;
+        double total_update_ms = 0.0;
+        double total_semantic_precomp_ms = 0.0;
+        double total_shard_assign_ms = 0.0;
+        double total_kernel_update_ms = 0.0;
+        double total_infer_ms = 0.0;
+        int update_calls = 0;
+        int infer_calls = 0;
+        std::atomic<int> new_block_count{0};
+    };
+    mutable ProfilingStats profiling_;
+    void printProfilingStats() const;
 
 private:
     static constexpr int BLOCK_SIZE = 8;
@@ -254,8 +262,6 @@ private:
     bool seed_osm_prior_;
     float osm_prior_strength_;
     bool osm_fallback_in_infer_;
-    float lambda_min_;
-    float lambda_max_;
     int current_time_ = 0;
 
     // Derived

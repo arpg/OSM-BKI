@@ -203,9 +203,7 @@ ContinuousBKI::ContinuousBKI(const Config& config,
               float alpha0,
               bool seed_osm_prior,
               float osm_prior_strength,
-              bool osm_fallback_in_infer,
-              float lambda_min,
-              float lambda_max)
+              bool osm_fallback_in_infer)
     : config_(config),
       osm_data_(osm_data),
       resolution_(resolution),
@@ -221,8 +219,6 @@ ContinuousBKI::ContinuousBKI(const Config& config,
       seed_osm_prior_(seed_osm_prior),
       osm_prior_strength_(osm_prior_strength),
       osm_fallback_in_infer_(osm_fallback_in_infer),
-      lambda_min_(lambda_min),
-      lambda_max_(lambda_max),
       current_time_(0)
 {
     K_pred_ = config.confusion_matrix.size();
@@ -277,8 +273,11 @@ ContinuousBKI::ContinuousBKI(const Config& config,
         label_to_matrix_flat_[static_cast<size_t>(kv.first)] = kv.second;
     }
 
-    // Build precomputed OSM prior raster (one-time cost)
+    auto t0_raster = std::chrono::high_resolution_clock::now();
     osm_prior_raster_.build(*this, resolution_);
+    auto t1_raster = std::chrono::high_resolution_clock::now();
+    profiling_.raster_build_ms = std::chrono::duration<double, std::milli>(t1_raster - t0_raster).count();
+    std::cout << "[Profiling] OSM raster build: " << profiling_.raster_build_ms << " ms" << std::endl;
 }
 
 void ContinuousBKI::clear() {
@@ -328,21 +327,18 @@ Block& ContinuousBKI::getOrCreateBlock(
         const BlockKey& bk,
         std::vector<float>& buf_m_i,
         std::vector<float>& buf_p_super,
-        std::vector<float>& buf_p_pred,
-        int current_time) const {
+        std::vector<float>& buf_p_pred) const {
     auto it = shard_map.find(bk);
     if (it != shard_map.end()) {
-        Block& blk = it->second;
-        if (blk.last_updated < current_time) {
-            applyLazyDecay(blk, bk, current_time, buf_m_i, buf_p_super, buf_p_pred);
-        }
         return it->second;
     }
+
+    profiling_.new_block_count.fetch_add(1, std::memory_order_relaxed);
 
     Block blk;
     const size_t total = static_cast<size_t>(BLOCK_SIZE * BLOCK_SIZE * BLOCK_SIZE * config_.num_total_classes);
     blk.alpha.resize(total, alpha0_);
-    blk.last_updated = current_time;
+    blk.last_updated = current_time_;
 
     if (seed_osm_prior_ && osm_prior_strength_ > 0.0f) {
         for (int lz = 0; lz < BLOCK_SIZE; lz++) {
@@ -360,52 +356,6 @@ Block& ContinuousBKI::getOrCreateBlock(
 
     auto inserted = shard_map.emplace(bk, std::move(blk));
     return inserted.first->second;
-}
-
-void ContinuousBKI::applyLazyDecay(Block& blk, const BlockKey& bk, int current_time,
-                                   std::vector<float>& buf_m_i,
-                                   std::vector<float>& buf_p_super,
-                                   std::vector<float>& buf_p_pred) const {
-    int dt = current_time - blk.last_updated;
-    blk.last_updated = current_time;
-
-    if (lambda_max_ < 1.0f) {
-        const int K = config_.num_total_classes;
-        
-        for (int lz = 0; lz < BLOCK_SIZE; lz++) {
-            for (int ly = 0; ly < BLOCK_SIZE; ly++) {
-                for (int lx = 0; lx < BLOCK_SIZE; lx++) {
-                    int vx = bk.x * BLOCK_SIZE + lx;
-                    int vy = bk.y * BLOCK_SIZE + ly;
-                    float wx = (vx + 0.5f) * resolution_;
-                    float wy = (vy + 0.5f) * resolution_;
-
-                    if (buf_m_i.size() != static_cast<size_t>(K_prior_))
-                        buf_m_i.resize(static_cast<size_t>(K_prior_));
-                    getOSMPrior(wx, wy, buf_m_i);
-
-                    float c_xi = 0.0f;
-                    for (float v : buf_m_i) if (v > c_xi) c_xi = v;
-
-                    float lambda = lambda_max_ - (lambda_max_ - lambda_min_) * c_xi;
-                    float lambda_eff = (dt == 1) ? lambda : std::pow(lambda, static_cast<float>(dt));
-
-                    computePredPriorFromOSM(wx, wy, buf_p_pred, buf_m_i, buf_p_super);
-
-                    int idx_base = flatIndex(lx, ly, lz, 0);
-                    for (int c = 0; c < K; c++) {
-                        float alpha_osm_c = alpha0_;
-                        if (seed_osm_prior_ && osm_prior_strength_ > 0.0f && buf_p_pred.size() == static_cast<size_t>(K)) {
-                            alpha_osm_c += osm_prior_strength_ * buf_p_pred[c];
-                        }
-                        
-                        float& alpha_curr = blk.alpha[static_cast<size_t>(idx_base + c)];
-                        alpha_curr = lambda_eff * alpha_curr + (1.0f - lambda_eff) * alpha_osm_c;
-                    }
-                }
-            }
-        }
-    }
 }
 
 const Block* ContinuousBKI::getBlockConst(const std::unordered_map<BlockKey, Block, BlockKeyHasher>& shard_map, const BlockKey& bk) const {
@@ -605,7 +555,8 @@ void ContinuousBKI::update_impl(const std::vector<ValueType>& values,
     }
 
     size_t n = points.size();
-    
+    auto t_update_start = std::chrono::high_resolution_clock::now();
+
     // Semantic Kernel Pre-computation (only for hard labels)
     std::vector<float> point_k_sem;
     if constexpr (std::is_same<ValueType, uint32_t>::value) {
@@ -643,6 +594,8 @@ void ContinuousBKI::update_impl(const std::vector<ValueType>& values,
         }
     }
 
+    auto t_sem_done = std::chrono::high_resolution_clock::now();
+
     current_time_++;
     int num_shards = static_cast<int>(block_shards_.size());
     int radius = static_cast<int>(std::ceil(l_scale_ / resolution_));
@@ -667,6 +620,8 @@ void ContinuousBKI::update_impl(const std::vector<ValueType>& values,
             }
         }
     }
+
+    auto t_shard_done = std::chrono::high_resolution_clock::now();
 
     #ifdef _OPENMP
     #pragma omp parallel num_threads(num_shards)
@@ -725,7 +680,7 @@ void ContinuousBKI::update_impl(const std::vector<ValueType>& values,
                         float k_sp = computeSpatialKernel(dist_sq);
                         if (k_sp <= 1e-6f) continue;
 
-                        Block& blk = getOrCreateBlock(shard, bk, tl_m_i, tl_p_super, tl_p_pred, current_time_);
+                        Block& blk = getOrCreateBlock(shard, bk, tl_m_i, tl_p_super, tl_p_pred);
                         int lx, ly, lz_local;
                         voxelToLocal(vk, lx, ly, lz_local);
 
@@ -747,6 +702,30 @@ void ContinuousBKI::update_impl(const std::vector<ValueType>& values,
     #ifdef _OPENMP
     }
     #endif
+
+    auto t_update_end = std::chrono::high_resolution_clock::now();
+    double ms_sem = std::chrono::duration<double, std::milli>(t_sem_done - t_update_start).count();
+    double ms_shard = std::chrono::duration<double, std::milli>(t_shard_done - t_sem_done).count();
+    double ms_kernel = std::chrono::duration<double, std::milli>(t_update_end - t_shard_done).count();
+    double ms_total = std::chrono::duration<double, std::milli>(t_update_end - t_update_start).count();
+
+    profiling_.update_calls++;
+    profiling_.total_update_ms += ms_total;
+    profiling_.total_semantic_precomp_ms += ms_sem;
+    profiling_.total_shard_assign_ms += ms_shard;
+    profiling_.total_kernel_update_ms += ms_kernel;
+
+    std::cout << "[Profiling] update #" << profiling_.update_calls
+              << ": " << ms_total << " ms total"
+              << " (sem_precomp=" << ms_sem << " ms"
+              << ", shard_assign=" << ms_shard << " ms"
+              << ", kernel_update=" << ms_kernel << " ms)"
+              << ", points=" << n
+              << ", radius=" << radius
+              << ", new_blocks=" << profiling_.new_block_count.load()
+              << std::endl;
+
+    profiling_.new_block_count.store(0);
 }
 
 int ContinuousBKI::size() const {
@@ -860,10 +839,11 @@ std::vector<std::vector<float>> ContinuousBKI::infer_probs(const std::vector<Poi
 
 template <typename ResultType>
 std::vector<ResultType> ContinuousBKI::infer_impl(const std::vector<Point3D>& points, bool return_probs) const {
+    auto t_infer_start = std::chrono::high_resolution_clock::now();
     const size_t n = points.size();
     std::vector<ResultType> results(n);
     const int K = config_.num_total_classes;
-    
+
     // Default values
     ResultType default_val;
     if constexpr (std::is_same<ResultType, uint32_t>::value) {
@@ -970,7 +950,37 @@ std::vector<ResultType> ContinuousBKI::infer_impl(const std::vector<Point3D>& po
     }
     #endif
 
+    auto t_infer_end = std::chrono::high_resolution_clock::now();
+    double ms_infer = std::chrono::duration<double, std::milli>(t_infer_end - t_infer_start).count();
+    profiling_.infer_calls++;
+    profiling_.total_infer_ms += ms_infer;
+
+    std::cout << "[Profiling] infer #" << profiling_.infer_calls
+              << ": " << ms_infer << " ms, points=" << n << std::endl;
+
     return results;
+}
+
+void ContinuousBKI::printProfilingStats() const {
+    std::cout << "\n=== ContinuousBKI Profiling Summary ===" << std::endl;
+    std::cout << "  OSM raster build:        " << profiling_.raster_build_ms << " ms (one-time)" << std::endl;
+    std::cout << "  Update calls:            " << profiling_.update_calls << std::endl;
+    std::cout << "    Total update time:     " << profiling_.total_update_ms << " ms" << std::endl;
+    if (profiling_.update_calls > 0) {
+        std::cout << "    Avg per update:        " << profiling_.total_update_ms / profiling_.update_calls << " ms" << std::endl;
+        std::cout << "    Semantic precomp:      " << profiling_.total_semantic_precomp_ms << " ms ("
+                  << (100.0 * profiling_.total_semantic_precomp_ms / profiling_.total_update_ms) << "%)" << std::endl;
+        std::cout << "    Shard assignment:      " << profiling_.total_shard_assign_ms << " ms ("
+                  << (100.0 * profiling_.total_shard_assign_ms / profiling_.total_update_ms) << "%)" << std::endl;
+        std::cout << "    Kernel update:         " << profiling_.total_kernel_update_ms << " ms ("
+                  << (100.0 * profiling_.total_kernel_update_ms / profiling_.total_update_ms) << "%)" << std::endl;
+    }
+    std::cout << "  Infer calls:             " << profiling_.infer_calls << std::endl;
+    std::cout << "    Total infer time:      " << profiling_.total_infer_ms << " ms" << std::endl;
+    if (profiling_.infer_calls > 0) {
+        std::cout << "    Avg per infer:         " << profiling_.total_infer_ms / profiling_.infer_calls << " ms" << std::endl;
+    }
+    std::cout << "========================================\n" << std::endl;
 }
 
 // --- Loader Implementations ---

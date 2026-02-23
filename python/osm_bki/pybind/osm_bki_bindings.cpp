@@ -87,16 +87,13 @@ public:
                     float alpha0 = 1.0f,
                     bool seed_osm_prior = false,
                     float osm_prior_strength = 0.0f,
-                    bool osm_fallback_in_infer = true,
-                    float lambda_min = 0.8f,
-                    float lambda_max = 0.99f)
+                    bool osm_fallback_in_infer = true)
         : config_(loadConfigFromYAML(config_path)),
           osm_data_(loadOSM(osm_path, config_)),
           bki_(config_, osm_data_,
                resolution, l_scale, sigma_0, prior_delta, height_sigma,
                use_semantic_kernel, use_spatial_kernel, num_threads,
-               alpha0, seed_osm_prior, osm_prior_strength, osm_fallback_in_infer,
-               lambda_min, lambda_max) {}
+               alpha0, seed_osm_prior, osm_prior_strength, osm_fallback_in_infer) {}
 
     // Hard labels update: update(labels, points) — labels first, matching Cython arg order
     void update(py::array_t<uint32_t> labels, py::array_t<float> points) {
@@ -193,6 +190,7 @@ public:
     void clear() { bki_.clear(); }
     void save(const std::string& filename) { bki_.save(filename); }
     void load(const std::string& filename) { bki_.load(filename); }
+    void print_profiling_stats() { bki_.printProfilingStats(); }
 
     // evaluate_metrics: convenience method not in Cython but non-conflicting
     py::dict evaluate_metrics(py::array_t<uint32_t> refined, py::array_t<uint32_t> gt) {
@@ -218,6 +216,66 @@ private:
 
 PYBIND11_MODULE(composite_bki_cpp, m) {
     m.doc() = "OSM-S-BKI / Composite BKI C++ extension: semantic BKI with OSM priors";
+
+    m.def("load_osm_geometries",
+          [](const std::string& osm_path, const std::string& config_path, double z_offset) {
+              Config config = loadConfigFromYAML(config_path);
+              OSMData data = loadOSM(osm_path, config);
+
+              std::map<int, std::string> idx_to_name;
+              for (const auto& kv : config.osm_class_map) {
+                  idx_to_name[kv.second] = kv.first;
+              }
+
+              auto get_color = [](const std::string& cat) -> std::vector<double> {
+                  if (cat == "buildings") return {30/255., 180/255., 30/255.};
+                  if (cat == "roads") return {240/255., 120/255., 20/255.};
+                  if (cat == "sidewalks") return {220/255., 220/255., 220/255.};
+                  if (cat == "parking") return {245/255., 210/255., 80/255.};
+                  if (cat == "fences" || cat == "barriers" || cat == "poles" || cat == "traffic_signs")
+                      return {170/255., 120/255., 70/255.};
+                  if (cat == "grasslands" || cat == "trees" || cat == "wood")
+                      return {60/255., 170/255., 80/255.};
+                  return {140/255., 140/255., 140/255.};
+              };
+
+              py::list result;
+              for (const auto& kv : data.geometries) {
+                  int class_idx = kv.first;
+                  std::string cat = idx_to_name.count(class_idx) ? idx_to_name[class_idx] : "default";
+                  std::vector<double> color = get_color(cat);
+
+                  std::vector<std::vector<double>> all_points;
+                  std::vector<std::vector<int>> all_lines;
+                  size_t point_offset = 0;
+
+                  for (const auto& poly : kv.second) {
+                      if (poly.points.size() < 2) continue;
+                      for (const auto& p : poly.points) {
+                          all_points.push_back({static_cast<double>(p.x), static_cast<double>(p.y), z_offset});
+                      }
+                      size_t n = poly.points.size();
+                      for (size_t i = 0; i < n; i++) {
+                          size_t j = (i + 1) % n;
+                          all_lines.push_back({static_cast<int>(point_offset + i), static_cast<int>(point_offset + j)});
+                      }
+                      point_offset += n;
+                  }
+
+                  if (all_points.empty()) continue;
+
+                  py::dict d;
+                  d["points"] = all_points;
+                  d["lines"] = all_lines;
+                  d["color"] = color;
+                  result.append(d);
+              }
+              return result;
+          },
+          py::arg("osm_path"),
+          py::arg("config_path"),
+          py::arg("z_offset") = 0.05,
+          "Load OSM file and return list of {points, lines, color} dicts for Open3D visualization.");
 
     m.def("latlon_to_mercator",
           [](double lat, double lon, double origin_lat, double origin_lon,
@@ -300,7 +358,7 @@ PYBIND11_MODULE(composite_bki_cpp, m) {
         .def(py::init<const std::string&, const std::string&,
                       float, float, float, float, float,
                       bool, bool, int,
-                      float, bool, float, bool, float, float>(),
+                      float, bool, float, bool>(),
              py::arg("osm_path"),
              py::arg("config_path"),
              py::arg("resolution") = 0.1f,
@@ -314,9 +372,7 @@ PYBIND11_MODULE(composite_bki_cpp, m) {
              py::arg("alpha0") = 1.0f,
              py::arg("seed_osm_prior") = false,
              py::arg("osm_prior_strength") = 0.0f,
-             py::arg("osm_fallback_in_infer") = true,
-             py::arg("lambda_min") = 0.8f,
-             py::arg("lambda_max") = 0.99f)
+             py::arg("osm_fallback_in_infer") = true)
         .def("update", &PyContinuousBKI::update,
              py::arg("labels"), py::arg("points"),
              "Update BKI with hard labels and points.")
@@ -341,5 +397,7 @@ PYBIND11_MODULE(composite_bki_cpp, m) {
              "Load a BKI map from a binary file.")
         .def("evaluate_metrics", &PyContinuousBKI::evaluate_metrics,
              py::arg("refined"), py::arg("gt"),
-             "Return dict with 'accuracy' and 'miou'.");
+             "Return dict with 'accuracy' and 'miou'.")
+        .def("print_profiling_stats", &PyContinuousBKI::print_profiling_stats,
+             "Print cumulative profiling statistics for raster build, update, and inference phases.");
 }
