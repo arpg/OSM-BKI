@@ -1,6 +1,6 @@
 """
 Build the composite_bki_cpp extension (pybind11) and install osm_bki package.
-Scripts expect: import composite_bki_cpp; composite_bki_cpp.run_pipeline(...); composite_bki_cpp.PySemanticBKI(...)
+Scripts expect: import composite_bki_cpp; composite_bki_cpp.PyContinuousBKI(...)
 """
 
 import atexit
@@ -66,8 +66,7 @@ def get_sources():
     sources = [
         str(pybind_src),
         str(cpp_src / "continuous_bki.cpp"),
-        str(cpp_src / "file_io.cpp"),
-        str(cpp_src / "dataset_utils.cpp"),
+        str(cpp_src / "osm_loader.cpp"),
     ]
     for s in sources:
         if not Path(s).exists():

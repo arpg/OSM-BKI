@@ -1,7 +1,6 @@
 #include "continuous_bki.hpp"
 #include "yaml_parser.hpp"
 #include "osm_xml_parser.hpp"
-#include <cstdint>
 #include <fstream>
 #include <limits>
 #include <cstring>
@@ -74,41 +73,6 @@ float Polygon::distance(const Point2D& p) const {
 // OSM Prior Raster: precompute 2D prior field for O(1) bilinear lookup
 // =====================================================================
 
-// Brute-force distance to class (all features, no spatial index).
-// Used only during one-time raster construction.
-static float computeDistanceToClassBruteForce(const OSMData& osm_data,
-                                               float x, float y, int class_idx) {
-    Point2D p(x, y);
-    float min_dist = std::numeric_limits<float>::max();
-
-    auto it_geom = osm_data.geometries.find(class_idx);
-    if (it_geom != osm_data.geometries.end()) {
-        for (const auto& poly : it_geom->second) {
-            float dist_bbox_x = std::max(0.0f, std::max(poly.min_x - p.x, p.x - poly.max_x));
-            float dist_bbox_y = std::max(0.0f, std::max(poly.min_y - p.y, p.y - poly.max_y));
-            float dist_bbox_sq = dist_bbox_x * dist_bbox_x + dist_bbox_y * dist_bbox_y;
-            if (dist_bbox_sq > min_dist * min_dist) continue;
-
-            float dist = poly.distance(p);
-            if (poly.contains(p)) dist = -dist;
-            min_dist = std::min(min_dist, dist);
-        }
-    }
-
-    auto it_points = osm_data.point_features.find(class_idx);
-    if (it_points != osm_data.point_features.end()) {
-        for (const auto& pt : it_points->second) {
-            float dx = p.x - pt.x;
-            float dy = p.y - pt.y;
-            float dist = std::sqrt(dx*dx + dy*dy);
-            min_dist = std::min(min_dist, dist);
-        }
-    }
-
-    if (min_dist == std::numeric_limits<float>::max()) return 50.0f;
-    return min_dist;
-}
-
 void ContinuousBKI::OSMPriorRaster::build(const ContinuousBKI& bki, float res) {
     K_prior = bki.K_prior_;
     if (K_prior <= 0) {
@@ -172,7 +136,7 @@ void ContinuousBKI::OSMPriorRaster::build(const ContinuousBKI& bki, float res) {
 
             float sum = 0.0f;
             for (int k = 0; k < K_prior; k++) {
-                float dist = computeDistanceToClassBruteForce(bki.osm_data_, x, y, k);
+                float dist = bki.computeDistanceToClass(x, y, k);
                 float score = 1.0f / (1.0f + std::exp((dist / bki.delta_) - 4.6f));
                 data[base + static_cast<size_t>(k)] = score;
                 sum += score;
@@ -368,68 +332,9 @@ Block& ContinuousBKI::getOrCreateBlock(
         int current_time) const {
     auto it = shard_map.find(bk);
     if (it != shard_map.end()) {
-        // Lazy decay: if block hasn't been updated this batch, apply forgetting
         Block& blk = it->second;
         if (blk.last_updated < current_time) {
-            int dt = current_time - blk.last_updated;
-            blk.last_updated = current_time;
-
-            // If lambda_max >= 1.0, maybe we skip decay? 
-            // But user asked for lambda in (0,1). Assuming lambda_max < 1.0 implies decay.
-            if (lambda_max_ < 1.0f) {
-                const int K = config_.num_total_classes;
-                
-                // Iterate all voxels in the block
-                for (int lz = 0; lz < BLOCK_SIZE; lz++) {
-                    for (int ly = 0; ly < BLOCK_SIZE; ly++) {
-                        for (int lx = 0; lx < BLOCK_SIZE; lx++) {
-                            // Compute world coordinate for OSM lookup
-                            int vx = bk.x * BLOCK_SIZE + lx;
-                            int vy = bk.y * BLOCK_SIZE + ly;
-                            // int vz = bk.z * BLOCK_SIZE + lz; // z not needed for 2D OSM prior
-                            float wx = (vx + 0.5f) * resolution_;
-                            float wy = (vy + 0.5f) * resolution_;
-
-                            // 1. Get OSM prior m_i (K_prior)
-                            // Reuse buf_m_i
-                            if (buf_m_i.size() != static_cast<size_t>(K_prior_))
-                                buf_m_i.resize(static_cast<size_t>(K_prior_));
-                            getOSMPrior(wx, wy, buf_m_i);
-
-                            // 2. Compute OSM confidence c_xi = max(m_i)
-                            float c_xi = 0.0f;
-                            for (float v : buf_m_i) if (v > c_xi) c_xi = v;
-
-                            // 3. Compute lambda(x)
-                            float lambda = lambda_max_ - (lambda_max_ - lambda_min_) * c_xi;
-                            
-                            // 4. Compute effective lambda for dt steps
-                            // If dt is large, pow might be slow. But dt is usually 1.
-                            float lambda_eff = (dt == 1) ? lambda : std::pow(lambda, static_cast<float>(dt));
-
-                            // 5. Compute alpha_osm(x)
-                            // alpha_osm = alpha0 + gamma * p_pred
-                            // We need p_pred. Reuse computePredPriorFromOSM logic but we already have m_i.
-                            // Let's just call computePredPriorFromOSM with the buffers, it re-calls getOSMPrior.
-                            // Optimization: computePredPriorFromOSM calls getOSMPrior internally. 
-                            // We can just call it directly.
-                            computePredPriorFromOSM(wx, wy, buf_p_pred, buf_m_i, buf_p_super);
-
-                            // 6. Apply decay: alpha = lambda_eff * alpha + (1-lambda_eff) * alpha_osm
-                            int idx_base = flatIndex(lx, ly, lz, 0);
-                            for (int c = 0; c < K; c++) {
-                                float alpha_osm_c = alpha0_;
-                                if (seed_osm_prior_ && osm_prior_strength_ > 0.0f && buf_p_pred.size() == static_cast<size_t>(K)) {
-                                    alpha_osm_c += osm_prior_strength_ * buf_p_pred[c];
-                                }
-                                
-                                float& alpha_curr = blk.alpha[static_cast<size_t>(idx_base + c)];
-                                alpha_curr = lambda_eff * alpha_curr + (1.0f - lambda_eff) * alpha_osm_c;
-                            }
-                        }
-                    }
-                }
-            }
+            applyLazyDecay(blk, bk, current_time, buf_m_i, buf_p_super, buf_p_pred);
         }
         return it->second;
     }
@@ -437,7 +342,7 @@ Block& ContinuousBKI::getOrCreateBlock(
     Block blk;
     const size_t total = static_cast<size_t>(BLOCK_SIZE * BLOCK_SIZE * BLOCK_SIZE * config_.num_total_classes);
     blk.alpha.resize(total, alpha0_);
-    blk.last_updated = current_time; // Initialize with current time
+    blk.last_updated = current_time;
 
     if (seed_osm_prior_ && osm_prior_strength_ > 0.0f) {
         for (int lz = 0; lz < BLOCK_SIZE; lz++) {
@@ -455,6 +360,52 @@ Block& ContinuousBKI::getOrCreateBlock(
 
     auto inserted = shard_map.emplace(bk, std::move(blk));
     return inserted.first->second;
+}
+
+void ContinuousBKI::applyLazyDecay(Block& blk, const BlockKey& bk, int current_time,
+                                   std::vector<float>& buf_m_i,
+                                   std::vector<float>& buf_p_super,
+                                   std::vector<float>& buf_p_pred) const {
+    int dt = current_time - blk.last_updated;
+    blk.last_updated = current_time;
+
+    if (lambda_max_ < 1.0f) {
+        const int K = config_.num_total_classes;
+        
+        for (int lz = 0; lz < BLOCK_SIZE; lz++) {
+            for (int ly = 0; ly < BLOCK_SIZE; ly++) {
+                for (int lx = 0; lx < BLOCK_SIZE; lx++) {
+                    int vx = bk.x * BLOCK_SIZE + lx;
+                    int vy = bk.y * BLOCK_SIZE + ly;
+                    float wx = (vx + 0.5f) * resolution_;
+                    float wy = (vy + 0.5f) * resolution_;
+
+                    if (buf_m_i.size() != static_cast<size_t>(K_prior_))
+                        buf_m_i.resize(static_cast<size_t>(K_prior_));
+                    getOSMPrior(wx, wy, buf_m_i);
+
+                    float c_xi = 0.0f;
+                    for (float v : buf_m_i) if (v > c_xi) c_xi = v;
+
+                    float lambda = lambda_max_ - (lambda_max_ - lambda_min_) * c_xi;
+                    float lambda_eff = (dt == 1) ? lambda : std::pow(lambda, static_cast<float>(dt));
+
+                    computePredPriorFromOSM(wx, wy, buf_p_pred, buf_m_i, buf_p_super);
+
+                    int idx_base = flatIndex(lx, ly, lz, 0);
+                    for (int c = 0; c < K; c++) {
+                        float alpha_osm_c = alpha0_;
+                        if (seed_osm_prior_ && osm_prior_strength_ > 0.0f && buf_p_pred.size() == static_cast<size_t>(K)) {
+                            alpha_osm_c += osm_prior_strength_ * buf_p_pred[c];
+                        }
+                        
+                        float& alpha_curr = blk.alpha[static_cast<size_t>(idx_base + c)];
+                        alpha_curr = lambda_eff * alpha_curr + (1.0f - lambda_eff) * alpha_osm_c;
+                    }
+                }
+            }
+        }
+    }
 }
 
 const Block* ContinuousBKI::getBlockConst(const std::unordered_map<BlockKey, Block, BlockKeyHasher>& shard_map, const BlockKey& bk) const {
@@ -547,7 +498,35 @@ float ContinuousBKI::computeSpatialKernel(float dist_sq) const {
 }
 
 float ContinuousBKI::computeDistanceToClass(float x, float y, int class_idx) const {
-    return computeDistanceToClassBruteForce(osm_data_, x, y, class_idx);
+    Point2D p(x, y);
+    float min_dist = std::numeric_limits<float>::max();
+
+    auto it_geom = osm_data_.geometries.find(class_idx);
+    if (it_geom != osm_data_.geometries.end()) {
+        for (const auto& poly : it_geom->second) {
+            float dist_bbox_x = std::max(0.0f, std::max(poly.min_x - p.x, p.x - poly.max_x));
+            float dist_bbox_y = std::max(0.0f, std::max(poly.min_y - p.y, p.y - poly.max_y));
+            float dist_bbox_sq = dist_bbox_x * dist_bbox_x + dist_bbox_y * dist_bbox_y;
+            if (dist_bbox_sq > min_dist * min_dist) continue;
+
+            float dist = poly.distance(p);
+            if (poly.contains(p)) dist = -dist;
+            min_dist = std::min(min_dist, dist);
+        }
+    }
+
+    auto it_points = osm_data_.point_features.find(class_idx);
+    if (it_points != osm_data_.point_features.end()) {
+        for (const auto& pt : it_points->second) {
+            float dx = p.x - pt.x;
+            float dy = p.y - pt.y;
+            float dist = std::sqrt(dx*dx + dy*dy);
+            min_dist = std::min(min_dist, dist);
+        }
+    }
+
+    if (min_dist == std::numeric_limits<float>::max()) return 50.0f;
+    return min_dist;
 }
 
 // getOSMPrior: uses precomputed raster when available, falls back to brute force
@@ -601,159 +580,75 @@ float ContinuousBKI::getSemanticKernel(int matrix_idx, const std::vector<float>&
 // update (labels overload)
 // =====================================================================
 void ContinuousBKI::update(const std::vector<uint32_t>& labels, const std::vector<Point3D>& points) {
-    if (labels.size() != points.size()) {
-        std::cerr << "Mismatch in points and labels size" << std::endl;
-        return;
-    }
-
-    size_t n = points.size();
-    std::vector<float> point_k_sem(n, 1.0f);
-    
-    // Increment global time for lazy decay
-    current_time_++;
-
-    if (use_semantic_kernel_) {
-#ifdef _OPENMP
-#pragma omp parallel
-        {
-            // Thread-local buffers: no heap allocs inside the loop
-            std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
-            std::vector<float> tl_expected_obs(static_cast<size_t>(K_pred_));
-#pragma omp for schedule(static)
-            for (size_t i = 0; i < n; i++) {
-                getOSMPrior(points[i].x, points[i].y, tl_m_i);
-                int raw_label = static_cast<int>(labels[i]);
-                int matrix_idx = (raw_label >= 0 && raw_label <= max_raw_label_)
-                                 ? label_to_matrix_flat_[static_cast<size_t>(raw_label)] : -1;
-                if (matrix_idx >= 0) {
-                    point_k_sem[i] = getSemanticKernel(matrix_idx, tl_m_i, tl_expected_obs);
-                }
-            }
-        }
-#else
-        std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
-        std::vector<float> tl_expected_obs(static_cast<size_t>(K_pred_));
-        for (size_t i = 0; i < n; i++) {
-            getOSMPrior(points[i].x, points[i].y, tl_m_i);
-            int raw_label = static_cast<int>(labels[i]);
-            int matrix_idx = (raw_label >= 0 && raw_label <= max_raw_label_)
-                             ? label_to_matrix_flat_[static_cast<size_t>(raw_label)] : -1;
-            if (matrix_idx >= 0) {
-                point_k_sem[i] = getSemanticKernel(matrix_idx, tl_m_i, tl_expected_obs);
-            }
-        }
-#endif
-    }
-
-    int num_shards = static_cast<int>(block_shards_.size());
-    int radius = static_cast<int>(std::ceil(l_scale_ / resolution_));
-    float l_scale_sq = l_scale_ * l_scale_;
-
-    // Pre-compute which shards each point's influence region touches.
-    std::vector<std::vector<size_t>> shard_points(static_cast<size_t>(num_shards));
-    for (size_t i = 0; i < n; i++) {
-        VoxelKey vk_p = pointToKey(points[i]);
-        BlockKey min_bk = voxelToBlockKey({vk_p.x - radius, vk_p.y - radius, vk_p.z - radius});
-        BlockKey max_bk = voxelToBlockKey({vk_p.x + radius, vk_p.y + radius, vk_p.z + radius});
-        std::vector<bool> added(static_cast<size_t>(num_shards), false);
-        for (int bx = min_bk.x; bx <= max_bk.x; bx++) {
-            for (int by = min_bk.y; by <= max_bk.y; by++) {
-                for (int bz = min_bk.z; bz <= max_bk.z; bz++) {
-                    int s = getShardIndex({bx, by, bz});
-                    if (!added[static_cast<size_t>(s)]) {
-                        shard_points[static_cast<size_t>(s)].push_back(i);
-                        added[static_cast<size_t>(s)] = true;
-                    }
-                }
-            }
-        }
-    }
-
-#ifdef _OPENMP
-#pragma omp parallel num_threads(num_shards)
-    {
-        // Thread-local buffers for getOrCreateBlock -> initVoxelAlpha -> computePredPriorFromOSM
-        std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
-        std::vector<float> tl_p_super(static_cast<size_t>(K_pred_));
-        std::vector<float> tl_p_pred(static_cast<size_t>(config_.num_total_classes));
-#pragma omp for schedule(static, 1)
-#endif
-    for (int s = 0; s < num_shards; ++s) {
-#ifndef _OPENMP
-        std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
-        std::vector<float> tl_p_super(static_cast<size_t>(K_pred_));
-        std::vector<float> tl_p_pred(static_cast<size_t>(config_.num_total_classes));
-#endif
-        auto& shard = block_shards_[static_cast<size_t>(s)];
-        const std::vector<size_t>& pts = shard_points[static_cast<size_t>(s)];
-
-        for (size_t pt_idx = 0; pt_idx < pts.size(); pt_idx++) {
-            size_t i = pts[pt_idx];
-            const Point3D& p = points[i];
-            VoxelKey vk_p = pointToKey(p);
-
-            int raw_label = static_cast<int>(labels[i]);
-            int dense_label = (raw_label >= 0 && raw_label <= max_raw_label_)
-                              ? raw_to_dense_flat_[static_cast<size_t>(raw_label)] : -1;
-            if (dense_label < 0) continue;
-            float k_sem = point_k_sem[i];
-
-            for (int dx = -radius; dx <= radius; dx++) {
-                int dy_limit = static_cast<int>(std::sqrt(std::max(0.0f,
-                    static_cast<float>(radius * radius - dx * dx))));
-                for (int dy = -dy_limit; dy <= dy_limit; dy++) {
-                    int dz_limit = static_cast<int>(std::sqrt(std::max(0.0f,
-                        static_cast<float>(radius * radius - dx * dx - dy * dy))));
-                    for (int dz = -dz_limit; dz <= dz_limit; dz++) {
-                        VoxelKey vk = {vk_p.x + dx, vk_p.y + dy, vk_p.z + dz};
-                        BlockKey bk = voxelToBlockKey(vk);
-                        if (getShardIndex(bk) != s) continue;
-
-                        Point3D v_center = keyToPoint(vk);
-                        float dist_sq = p.dist_sq(v_center);
-                        if (dist_sq > l_scale_sq) continue;
-
-                        float k_sp = computeSpatialKernel(dist_sq);
-                        if (k_sp <= 1e-6f) continue;
-
-                        Block& blk = getOrCreateBlock(shard, bk, tl_m_i, tl_p_super, tl_p_pred, current_time_);
-                        int lx, ly, lz_local;
-                        voxelToLocal(vk, lx, ly, lz_local);
-                        int idx = flatIndex(lx, ly, lz_local, dense_label);
-                        blk.alpha[static_cast<size_t>(idx)] += k_sp * k_sem;
-                    }
-                }
-            }
-        }
-    }
-#ifdef _OPENMP
-    }
-#endif
+    update_impl(labels, points, {}, false);
 }
 
 // =====================================================================
 // update (probs overload)
 // =====================================================================
 void ContinuousBKI::update(const std::vector<std::vector<float>>& probs, const std::vector<Point3D>& points, const std::vector<float>& weights) {
-    if (probs.size() != points.size()) {
-        std::cerr << "Mismatch in points and probs size" << std::endl;
+    update_impl(probs, points, weights, !weights.empty());
+}
+
+template <typename ValueType>
+void ContinuousBKI::update_impl(const std::vector<ValueType>& values,
+                                const std::vector<Point3D>& points,
+                                const std::vector<float>& weights,
+                                bool use_weights) {
+    if (values.size() != points.size()) {
+        std::cerr << "Mismatch in points and values size" << std::endl;
         return;
     }
-    bool use_weights = !weights.empty();
     if (use_weights && weights.size() != points.size()) {
         std::cerr << "Mismatch in points and weights size" << std::endl;
         return;
     }
 
     size_t n = points.size();
+    
+    // Semantic Kernel Pre-computation (only for hard labels)
+    std::vector<float> point_k_sem;
+    if constexpr (std::is_same<ValueType, uint32_t>::value) {
+        point_k_sem.assign(n, 1.0f);
+        if (use_semantic_kernel_) {
+            #ifdef _OPENMP
+            #pragma omp parallel
+            {
+                std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
+                std::vector<float> tl_expected_obs(static_cast<size_t>(K_pred_));
+                #pragma omp for schedule(static)
+                for (size_t i = 0; i < n; i++) {
+                    getOSMPrior(points[i].x, points[i].y, tl_m_i);
+                    int raw_label = static_cast<int>(values[i]);
+                    int matrix_idx = (raw_label >= 0 && raw_label <= max_raw_label_)
+                                     ? label_to_matrix_flat_[static_cast<size_t>(raw_label)] : -1;
+                    if (matrix_idx >= 0) {
+                        point_k_sem[i] = getSemanticKernel(matrix_idx, tl_m_i, tl_expected_obs);
+                    }
+                }
+            }
+            #else
+            std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
+            std::vector<float> tl_expected_obs(static_cast<size_t>(K_pred_));
+            for (size_t i = 0; i < n; i++) {
+                getOSMPrior(points[i].x, points[i].y, tl_m_i);
+                int raw_label = static_cast<int>(values[i]);
+                int matrix_idx = (raw_label >= 0 && raw_label <= max_raw_label_)
+                                 ? label_to_matrix_flat_[static_cast<size_t>(raw_label)] : -1;
+                if (matrix_idx >= 0) {
+                    point_k_sem[i] = getSemanticKernel(matrix_idx, tl_m_i, tl_expected_obs);
+                }
+            }
+            #endif
+        }
+    }
+
+    current_time_++;
     int num_shards = static_cast<int>(block_shards_.size());
     int radius = static_cast<int>(std::ceil(l_scale_ / resolution_));
     float l_scale_sq = l_scale_ * l_scale_;
 
-    // Increment global time for lazy decay
-    current_time_++;
-
-    // Pre-compute which shards each point's influence region touches.
+    // Shard assignment
     std::vector<std::vector<size_t>> shard_points(static_cast<size_t>(num_shards));
     for (size_t i = 0; i < n; i++) {
         VoxelKey vk_p = pointToKey(points[i]);
@@ -773,20 +668,21 @@ void ContinuousBKI::update(const std::vector<std::vector<float>>& probs, const s
         }
     }
 
-#ifdef _OPENMP
-#pragma omp parallel num_threads(num_shards)
+    #ifdef _OPENMP
+    #pragma omp parallel num_threads(num_shards)
     {
         std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
         std::vector<float> tl_p_super(static_cast<size_t>(K_pred_));
         std::vector<float> tl_p_pred(static_cast<size_t>(config_.num_total_classes));
-#pragma omp for schedule(static, 1)
-#endif
+        #pragma omp for schedule(static, 1)
+    #endif
     for (int s = 0; s < num_shards; ++s) {
-#ifndef _OPENMP
+        #ifndef _OPENMP
         std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
         std::vector<float> tl_p_super(static_cast<size_t>(K_pred_));
         std::vector<float> tl_p_pred(static_cast<size_t>(config_.num_total_classes));
-#endif
+        #endif
+        
         auto& shard = block_shards_[static_cast<size_t>(s)];
         const std::vector<size_t>& pts = shard_points[static_cast<size_t>(s)];
 
@@ -794,9 +690,22 @@ void ContinuousBKI::update(const std::vector<std::vector<float>>& probs, const s
             size_t i = pts[pt_idx];
             const Point3D& p = points[i];
             VoxelKey vk_p = pointToKey(p);
-
-            const std::vector<float>& prob = probs[i];
             float w_i = use_weights ? weights[i] : 1.0f;
+
+            // Prepare update value
+            int dense_label = -1;
+            float k_sem = 1.0f;
+            const std::vector<float>* prob_ptr = nullptr;
+
+            if constexpr (std::is_same<ValueType, uint32_t>::value) {
+                int raw_label = static_cast<int>(values[i]);
+                dense_label = (raw_label >= 0 && raw_label <= max_raw_label_)
+                              ? raw_to_dense_flat_[static_cast<size_t>(raw_label)] : -1;
+                if (dense_label < 0) continue;
+                k_sem = point_k_sem[i];
+            } else {
+                prob_ptr = &values[i];
+            }
 
             for (int dx = -radius; dx <= radius; dx++) {
                 int dy_limit = static_cast<int>(std::sqrt(std::max(0.0f,
@@ -820,18 +729,24 @@ void ContinuousBKI::update(const std::vector<std::vector<float>>& probs, const s
                         int lx, ly, lz_local;
                         voxelToLocal(vk, lx, ly, lz_local);
 
-                        for (size_t c = 0; c < prob.size(); c++) {
-                            int idx = flatIndex(lx, ly, lz_local, static_cast<int>(c));
-                            blk.alpha[static_cast<size_t>(idx)] += w_i * k_sp * prob[c];
+                        if constexpr (std::is_same<ValueType, uint32_t>::value) {
+                            int idx = flatIndex(lx, ly, lz_local, dense_label);
+                            blk.alpha[static_cast<size_t>(idx)] += k_sp * k_sem;
+                        } else {
+                            size_t K_clamp = std::min(prob_ptr->size(), static_cast<size_t>(config_.num_total_classes));
+                            for (size_t c = 0; c < K_clamp; c++) {
+                                int idx = flatIndex(lx, ly, lz_local, static_cast<int>(c));
+                                blk.alpha[static_cast<size_t>(idx)] += w_i * k_sp * (*prob_ptr)[c];
+                            }
                         }
                     }
                 }
             }
         }
     }
-#ifdef _OPENMP
+    #ifdef _OPENMP
     }
-#endif
+    #endif
 }
 
 int ContinuousBKI::size() const {
@@ -933,121 +848,47 @@ void ContinuousBKI::load(const std::string& filename) {
 // infer - parallelized with OpenMP
 // =====================================================================
 std::vector<uint32_t> ContinuousBKI::infer(const std::vector<Point3D>& points) const {
-    const size_t n = points.size();
-    std::vector<uint32_t> results(n, 0);
-
-#ifdef _OPENMP
-#pragma omp parallel
-    {
-        // Thread-local buffers for OSM fallback path
-        std::vector<float> tl_p_pred(static_cast<size_t>(config_.num_total_classes));
-        std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
-        std::vector<float> tl_p_super(static_cast<size_t>(K_pred_));
-
-#pragma omp for schedule(static)
-        for (size_t i = 0; i < n; i++) {
-            const Point3D& p = points[i];
-            VoxelKey k = pointToKey(p);
-            BlockKey bk = voxelToBlockKey(k);
-            int s = getShardIndex(bk);
-            const Block* blk = getBlockConst(block_shards_[static_cast<size_t>(s)], bk);
-
-            if (blk != nullptr) {
-                int lx, ly, lz;
-                voxelToLocal(k, lx, ly, lz);
-                float sum = 0.0f;
-                int best_idx = 0;
-                float best_val = -1.0f;
-                for (int c = 0; c < config_.num_total_classes; c++) {
-                    float v = blk->alpha[static_cast<size_t>(flatIndex(lx, ly, lz, c))];
-                    sum += v;
-                    if (v > best_val) { best_val = v; best_idx = c; }
-                }
-                if (sum > epsilon_) {
-                    int raw = (best_idx >= 0 && best_idx < static_cast<int>(dense_to_raw_flat_.size()))
-                              ? dense_to_raw_flat_[static_cast<size_t>(best_idx)] : -1;
-                    results[i] = (raw >= 0) ? static_cast<uint32_t>(raw) : 0;
-                    continue;
-                }
-            }
-
-            if (osm_fallback_in_infer_ && K_pred_ > 0) {
-                computePredPriorFromOSM(p.x, p.y, tl_p_pred, tl_m_i, tl_p_super);
-                if (!tl_p_pred.empty()) {
-                    int best = static_cast<int>(std::max_element(tl_p_pred.begin(), tl_p_pred.end()) - tl_p_pred.begin());
-                    if (best >= 0 && best < static_cast<int>(dense_to_raw_flat_.size())) {
-                        int raw = dense_to_raw_flat_[static_cast<size_t>(best)];
-                        results[i] = (raw >= 0) ? static_cast<uint32_t>(raw) : 0;
-                    }
-                }
-            }
-        }
-    }
-#else
-    std::vector<float> tl_p_pred(static_cast<size_t>(config_.num_total_classes));
-    std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
-    std::vector<float> tl_p_super(static_cast<size_t>(K_pred_));
-
-    for (size_t i = 0; i < n; i++) {
-        const Point3D& p = points[i];
-        VoxelKey k = pointToKey(p);
-        BlockKey bk = voxelToBlockKey(k);
-        int s = getShardIndex(bk);
-        const Block* blk = getBlockConst(block_shards_[static_cast<size_t>(s)], bk);
-
-        if (blk != nullptr) {
-            int lx, ly, lz;
-            voxelToLocal(k, lx, ly, lz);
-            float sum = 0.0f;
-            int best_idx = 0;
-            float best_val = -1.0f;
-            for (int c = 0; c < config_.num_total_classes; c++) {
-                float v = blk->alpha[static_cast<size_t>(flatIndex(lx, ly, lz, c))];
-                sum += v;
-                if (v > best_val) { best_val = v; best_idx = c; }
-            }
-            if (sum > epsilon_) {
-                int raw = (best_idx >= 0 && best_idx < static_cast<int>(dense_to_raw_flat_.size()))
-                          ? dense_to_raw_flat_[static_cast<size_t>(best_idx)] : -1;
-                results[i] = (raw >= 0) ? static_cast<uint32_t>(raw) : 0;
-                continue;
-            }
-        }
-
-        if (osm_fallback_in_infer_ && K_pred_ > 0) {
-            computePredPriorFromOSM(p.x, p.y, tl_p_pred, tl_m_i, tl_p_super);
-            if (!tl_p_pred.empty()) {
-                int best = static_cast<int>(std::max_element(tl_p_pred.begin(), tl_p_pred.end()) - tl_p_pred.begin());
-                if (best >= 0 && best < static_cast<int>(dense_to_raw_flat_.size())) {
-                    int raw = dense_to_raw_flat_[static_cast<size_t>(best)];
-                    results[i] = (raw >= 0) ? static_cast<uint32_t>(raw) : 0;
-                }
-            }
-        }
-    }
-#endif
-
-    return results;
+    return infer_impl<uint32_t>(points, false);
 }
 
 // =====================================================================
 // infer_probs - parallelized with OpenMP
 // =====================================================================
 std::vector<std::vector<float>> ContinuousBKI::infer_probs(const std::vector<Point3D>& points) const {
-    const size_t n = points.size();
-    const int K = config_.num_total_classes;
-    std::vector<std::vector<float>> results(n);
+    return infer_impl<std::vector<float>>(points, true);
+}
 
-#ifdef _OPENMP
-#pragma omp parallel
+template <typename ResultType>
+std::vector<ResultType> ContinuousBKI::infer_impl(const std::vector<Point3D>& points, bool return_probs) const {
+    const size_t n = points.size();
+    std::vector<ResultType> results(n);
+    const int K = config_.num_total_classes;
+    
+    // Default values
+    ResultType default_val;
+    if constexpr (std::is_same<ResultType, uint32_t>::value) {
+        default_val = 0;
+    } else {
+        default_val.assign(K, 1.0f / K);
+    }
+
+    #ifdef _OPENMP
+    #pragma omp parallel
     {
-        std::vector<float> tl_probs(static_cast<size_t>(K));
         std::vector<float> tl_p_pred(static_cast<size_t>(K));
         std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
         std::vector<float> tl_p_super(static_cast<size_t>(K_pred_));
-        std::vector<float> uniform(static_cast<size_t>(K), 1.0f / static_cast<float>(K));
+        std::vector<float> tl_probs; 
+        if (return_probs) tl_probs.resize(K);
 
-#pragma omp for schedule(static)
+        #pragma omp for schedule(static)
+    #else
+        std::vector<float> tl_p_pred(static_cast<size_t>(K));
+        std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
+        std::vector<float> tl_p_super(static_cast<size_t>(K_pred_));
+        std::vector<float> tl_probs; 
+        if (return_probs) tl_probs.resize(K);
+    #endif
         for (size_t i = 0; i < n; i++) {
             const Point3D& p = points[i];
             VoxelKey k = pointToKey(p);
@@ -1055,468 +896,84 @@ std::vector<std::vector<float>> ContinuousBKI::infer_probs(const std::vector<Poi
             int s = getShardIndex(bk);
             const Block* blk = getBlockConst(block_shards_[static_cast<size_t>(s)], bk);
 
+            bool found_in_block = false;
             if (blk != nullptr) {
                 int lx, ly, lz;
                 voxelToLocal(k, lx, ly, lz);
-                float sum = 0.0f;
-                for (int c = 0; c < K; c++) {
-                    tl_probs[c] = blk->alpha[static_cast<size_t>(flatIndex(lx, ly, lz, c))];
-                    sum += tl_probs[c];
-                }
-                if (sum > epsilon_) {
-                    for (int c = 0; c < K; c++) tl_probs[c] /= sum;
-                    results[i] = tl_probs;
-                    continue;
+                
+                if (!return_probs) {
+                    // Hard label inference
+                    float sum = 0.0f;
+                    int best_idx = 0;
+                    float best_val = -1.0f;
+                    for (int c = 0; c < K; c++) {
+                        float v = blk->alpha[static_cast<size_t>(flatIndex(lx, ly, lz, c))];
+                        sum += v;
+                        if (v > best_val) { best_val = v; best_idx = c; }
+                    }
+                    if (sum > epsilon_) {
+                        int raw = (best_idx >= 0 && best_idx < static_cast<int>(dense_to_raw_flat_.size()))
+                                  ? dense_to_raw_flat_[static_cast<size_t>(best_idx)] : -1;
+                        if constexpr (std::is_same<ResultType, uint32_t>::value) {
+                            results[i] = (raw >= 0) ? static_cast<uint32_t>(raw) : 0;
+                        }
+                        found_in_block = true;
+                    }
+                } else {
+                    // Probabilities inference
+                    float sum = 0.0f;
+                    for (int c = 0; c < K; c++) {
+                        tl_probs[c] = blk->alpha[static_cast<size_t>(flatIndex(lx, ly, lz, c))];
+                        sum += tl_probs[c];
+                    }
+                    if (sum > epsilon_) {
+                        for (int c = 0; c < K; c++) tl_probs[c] /= sum;
+                        if constexpr (std::is_same<ResultType, std::vector<float>>::value) {
+                            results[i] = tl_probs;
+                        }
+                        found_in_block = true;
+                    }
                 }
             }
 
+            if (found_in_block) continue;
+
+            // Fallback to OSM
             if (osm_fallback_in_infer_ && K_pred_ > 0) {
                 computePredPriorFromOSM(p.x, p.y, tl_p_pred, tl_m_i, tl_p_super);
-                if (tl_p_pred.size() == static_cast<size_t>(K)) {
-                    results[i] = tl_p_pred;
+                
+                if (!return_probs) {
+                    if (!tl_p_pred.empty()) {
+                        int best = static_cast<int>(std::max_element(tl_p_pred.begin(), tl_p_pred.end()) - tl_p_pred.begin());
+                        int raw = (best >= 0 && best < static_cast<int>(dense_to_raw_flat_.size())) 
+                                  ? dense_to_raw_flat_[static_cast<size_t>(best)] : -1;
+                        if constexpr (std::is_same<ResultType, uint32_t>::value) {
+                            results[i] = (raw >= 0) ? static_cast<uint32_t>(raw) : 0;
+                        }
+                    } else {
+                        results[i] = default_val;
+                    }
                 } else {
-                    results[i] = uniform;
+                    if (tl_p_pred.size() == static_cast<size_t>(K)) {
+                        if constexpr (std::is_same<ResultType, std::vector<float>>::value) {
+                            results[i] = tl_p_pred;
+                        }
+                    } else {
+                        results[i] = default_val;
+                    }
                 }
             } else {
-                results[i] = uniform;
+                results[i] = default_val;
             }
         }
+    #ifdef _OPENMP
     }
-#else
-    std::vector<float> tl_probs(static_cast<size_t>(K));
-    std::vector<float> tl_p_pred(static_cast<size_t>(K));
-    std::vector<float> tl_m_i(static_cast<size_t>(K_prior_));
-    std::vector<float> tl_p_super(static_cast<size_t>(K_pred_));
-    std::vector<float> uniform(static_cast<size_t>(K), 1.0f / static_cast<float>(K));
-
-    for (size_t i = 0; i < n; i++) {
-        const Point3D& p = points[i];
-        VoxelKey k = pointToKey(p);
-        BlockKey bk = voxelToBlockKey(k);
-        int s = getShardIndex(bk);
-        const Block* blk = getBlockConst(block_shards_[static_cast<size_t>(s)], bk);
-
-        if (blk != nullptr) {
-            int lx, ly, lz;
-            voxelToLocal(k, lx, ly, lz);
-            float sum = 0.0f;
-            for (int c = 0; c < K; c++) {
-                tl_probs[c] = blk->alpha[static_cast<size_t>(flatIndex(lx, ly, lz, c))];
-                sum += tl_probs[c];
-            }
-            if (sum > epsilon_) {
-                for (int c = 0; c < K; c++) tl_probs[c] /= sum;
-                results[i] = tl_probs;
-                continue;
-            }
-        }
-
-        if (osm_fallback_in_infer_ && K_pred_ > 0) {
-            computePredPriorFromOSM(p.x, p.y, tl_p_pred, tl_m_i, tl_p_super);
-            if (tl_p_pred.size() == static_cast<size_t>(K)) {
-                results[i] = tl_p_pred;
-            } else {
-                results[i] = uniform;
-            }
-        } else {
-            results[i] = uniform;
-        }
-    }
-#endif
+    #endif
 
     return results;
 }
 
 // --- Loader Implementations ---
-
-OSMData loadOSMBinary(const std::string& filename,
-                      const std::map<std::string, int>& osm_class_map,
-                      const std::vector<std::string>& osm_categories) {
-    OSMData data;
-    std::ifstream file(filename, std::ios::binary);
-
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to open OSM file: " + filename);
-    }
-
-    if (osm_categories.empty()) {
-        throw std::runtime_error("OSM categories missing from config.");
-    }
-
-    for (const auto& cat : osm_categories) {
-        uint32_t num_items;
-        file.read(reinterpret_cast<char*>(&num_items), sizeof(uint32_t));
-        if (!file.good()) break;
-
-        auto class_it = osm_class_map.find(cat);
-        bool has_class = (class_it != osm_class_map.end());
-        int class_idx = has_class ? class_it->second : -1;
-
-        for (uint32_t i = 0; i < num_items; i++) {
-            uint32_t n_pts;
-            file.read(reinterpret_cast<char*>(&n_pts), sizeof(uint32_t));
-            if (!file.good()) break;
-
-            Polygon poly;
-            poly.points.reserve(n_pts);
-            for (uint32_t j = 0; j < n_pts; j++) {
-                float x, y;
-                file.read(reinterpret_cast<char*>(&x), sizeof(float));
-                file.read(reinterpret_cast<char*>(&y), sizeof(float));
-                poly.points.push_back(Point2D(x, y));
-            }
-            poly.computeBounds();
-            if (has_class) {
-                data.geometries[class_idx].push_back(poly);
-            }
-        }
-    }
-
-    file.close();
-    return data;
-}
-
-// Classify a way's tags into an OSM class index.
-static int classifyWayTags(const std::map<std::string, std::string>& tags,
-                           const std::map<std::string, int>& osm_class_map,
-                           bool& is_area) {
-    is_area = false;
-
-    auto it = tags.find("building");
-    if (it != tags.end()) {
-        is_area = true;
-        auto c = osm_class_map.find("buildings");
-        return (c != osm_class_map.end()) ? c->second : -1;
-    }
-
-    it = tags.find("highway");
-    if (it != tags.end()) {
-        const std::string& val = it->second;
-        is_area = false;
-        if (val == "footway" || val == "path" || val == "steps" || val == "pedestrian") {
-            auto c = osm_class_map.find("sidewalks");
-            return (c != osm_class_map.end()) ? c->second : -1;
-        } else {
-            auto c = osm_class_map.find("roads");
-            return (c != osm_class_map.end()) ? c->second : -1;
-        }
-    }
-
-    it = tags.find("landuse");
-    if (it != tags.end()) {
-        is_area = true;
-        const std::string& val = it->second;
-        if (val == "grass" || val == "meadow" || val == "park" || val == "recreation_ground") {
-            auto c = osm_class_map.find("grasslands");
-            return (c != osm_class_map.end()) ? c->second : -1;
-        } else if (val == "forest") {
-            auto c = osm_class_map.find("trees");
-            return (c != osm_class_map.end()) ? c->second : -1;
-        }
-        return -1;
-    }
-
-    it = tags.find("natural");
-    if (it != tags.end()) {
-        is_area = true;
-        const std::string& val = it->second;
-        if (val == "tree" || val == "wood") {
-            auto c = osm_class_map.find("trees");
-            return (c != osm_class_map.end()) ? c->second : -1;
-        } else if (val == "grassland" || val == "scrub") {
-            auto c = osm_class_map.find("grasslands");
-            return (c != osm_class_map.end()) ? c->second : -1;
-        }
-        return -1;
-    }
-
-    it = tags.find("barrier");
-    if (it != tags.end()) {
-        is_area = false;
-        const std::string& val = it->second;
-        if (val == "fence" || val == "wall" || val == "hedge") {
-            auto c = osm_class_map.find("fences");
-            return (c != osm_class_map.end()) ? c->second : -1;
-        }
-        return -1;
-    }
-
-    it = tags.find("amenity");
-    if (it != tags.end()) {
-        is_area = true;
-        if (it->second == "parking") {
-            auto c = osm_class_map.find("parking");
-            return (c != osm_class_map.end()) ? c->second : -1;
-        }
-        return -1;
-    }
-
-    return -1;
-}
-
-static Polygon bufferPolyline(const std::vector<Point2D>& coords, float half_width) {
-    Polygon poly;
-    if (coords.size() < 2) return poly;
-
-    std::vector<Point2D> left_side, right_side;
-    for (size_t i = 0; i < coords.size() - 1; i++) {
-        float dx = coords[i+1].x - coords[i].x;
-        float dy = coords[i+1].y - coords[i].y;
-        float len = std::sqrt(dx*dx + dy*dy);
-        if (len < 1e-6f) continue;
-        float nx = -dy / len * half_width;
-        float ny = dx / len * half_width;
-
-        if (i == 0) {
-            left_side.push_back(Point2D(coords[i].x + nx, coords[i].y + ny));
-            right_side.push_back(Point2D(coords[i].x - nx, coords[i].y - ny));
-        }
-        left_side.push_back(Point2D(coords[i+1].x + nx, coords[i+1].y + ny));
-        right_side.push_back(Point2D(coords[i+1].x - nx, coords[i+1].y - ny));
-    }
-
-    for (const auto& p : left_side) poly.points.push_back(p);
-    for (auto it = right_side.rbegin(); it != right_side.rend(); ++it) {
-        poly.points.push_back(*it);
-    }
-
-    if (poly.points.size() >= 3) {
-        poly.computeBounds();
-    }
-    return poly;
-}
-
-OSMData loadOSMXML(const std::string& filename,
-                   const Config& config) {
-    OSMData data;
-    osm_xml_parser::OSMParser parser;
-    
-    const auto& osm_class_map = config.osm_class_map;
-
-    try {
-        parser.parse(filename);
-    } catch (const std::exception& e) {
-        throw std::runtime_error("Failed to parse OSM XML: " + std::string(e.what()));
-    }
-    
-    if (parser.nodes.empty()) {
-        std::cerr << "Warning: No nodes found in OSM file" << std::endl;
-        return data;
-    }
-    
-    double origin_lat, origin_lon;
-    double offset_x = config.osm_world_offset_x;
-    double offset_y = config.osm_world_offset_y;
-
-    {
-        std::ifstream bounds_scan(filename);
-        std::string bline;
-        bool found_bounds = false;
-        while (std::getline(bounds_scan, bline)) {
-            if (bline.find("<bounds") != std::string::npos) {
-                std::string minlat_s = osm_xml_parser::get_attribute(bline, "minlat");
-                std::string maxlat_s = osm_xml_parser::get_attribute(bline, "maxlat");
-                std::string minlon_s = osm_xml_parser::get_attribute(bline, "minlon");
-                std::string maxlon_s = osm_xml_parser::get_attribute(bline, "maxlon");
-                if (!minlat_s.empty() && !maxlat_s.empty() &&
-                    !minlon_s.empty() && !maxlon_s.empty()) {
-                    double minlat = std::stod(minlat_s);
-                    double maxlat = std::stod(maxlat_s);
-                    double minlon = std::stod(minlon_s);
-                    double maxlon = std::stod(maxlon_s);
-                    origin_lat = (minlat + maxlat) / 2.0;
-                    origin_lon = (minlon + maxlon) / 2.0;
-                    found_bounds = true;
-                    std::cout << "OSM XML: Using <bounds> centroid as origin ("
-                              << origin_lat << ", " << origin_lon << ")" << std::endl;
-                }
-                break;
-            }
-        }
-        if (!found_bounds) {
-            auto center = parser.get_center();
-            origin_lat = center.first;
-            origin_lon = center.second;
-            std::cout << "OSM XML: No <bounds> found, using node centroid as origin ("
-                      << origin_lat << ", " << origin_lon << ")" << std::endl;
-        }
-    }
-
-    std::cout << "OSM XML: Flat-earth projection, origin ("
-              << origin_lat << ", " << origin_lon
-              << "), world offset (" << offset_x << ", " << offset_y << ")" << std::endl;
-
-    std::map<std::string, Point2D> node_coords;
-
-    for (const auto& kv : parser.nodes) {
-        auto xy = osm_xml_parser::latlon_to_meters(
-            kv.second.lat, kv.second.lon, origin_lat, origin_lon);
-        double x = xy.first + offset_x;
-        double y = xy.second + offset_y;
-        node_coords[kv.first] = Point2D(static_cast<float>(x), static_cast<float>(y));
-    }
-    
-    for (const auto& kv : parser.nodes) {
-        const osm_xml_parser::OSMNode& node = kv.second;
-        const Point2D& pt = node_coords[kv.first];
-        
-        int class_idx = -1;
-        for (const auto& tag : node.tags) {
-            const std::string& key = tag.first;
-            const std::string& val = tag.second;
-            
-            if (key == "highway") {
-                if (val == "street_lamp" || val == "street_light") {
-                    auto it = osm_class_map.find("poles");
-                    if (it != osm_class_map.end()) class_idx = it->second;
-                } else if (val == "traffic_signals" || val == "stop") {
-                    auto it = osm_class_map.find("traffic_signs");
-                    if (it != osm_class_map.end()) class_idx = it->second;
-                }
-            } else if (key == "barrier") {
-                if (val == "bollard" || val == "gate") {
-                    auto it = osm_class_map.find("barriers");
-                    if (it != osm_class_map.end()) class_idx = it->second;
-                }
-            } else if (key == "amenity" && val == "parking") {
-                auto it = osm_class_map.find("parking");
-                if (it != osm_class_map.end()) class_idx = it->second;
-            }
-            
-            if (class_idx >= 0) {
-                data.point_features[class_idx].push_back(pt);
-                break;
-            }
-        }
-    }
-    
-    constexpr float ROAD_HALF_WIDTH = 3.0f;
-    constexpr float SIDEWALK_HALF_WIDTH = 1.5f;
-    constexpr float FENCE_HALF_WIDTH = 0.3f;
-
-    int polygon_count = 0, polyline_count = 0;
-    for (const auto& way : parser.ways) {
-        if (way.node_refs.size() < 2) continue;
-        
-        std::vector<Point2D> coords;
-        for (const auto& ref : way.node_refs) {
-            auto it = node_coords.find(ref);
-            if (it != node_coords.end()) {
-                coords.push_back(it->second);
-            }
-        }
-        
-        if (coords.size() < 2) continue;
-        
-        bool is_area = false;
-        int class_idx = classifyWayTags(way.tags, osm_class_map, is_area);
-        if (class_idx < 0) continue;
-        
-        bool way_is_closed = way.is_closed();
-
-        if (is_area && way_is_closed && coords.size() >= 3) {
-            Polygon poly;
-            poly.points = coords;
-            poly.computeBounds();
-            data.geometries[class_idx].push_back(poly);
-            polygon_count++;
-        } else if (!is_area || !way_is_closed) {
-            float hw = ROAD_HALF_WIDTH;
-
-            auto hw_it = way.tags.find("highway");
-            if (hw_it != way.tags.end()) {
-                const std::string& v = hw_it->second;
-                if (v == "footway" || v == "path" || v == "steps" || v == "pedestrian") {
-                    hw = SIDEWALK_HALF_WIDTH;
-                }
-            }
-            auto bar_it = way.tags.find("barrier");
-            if (bar_it != way.tags.end()) {
-                hw = FENCE_HALF_WIDTH;
-            }
-
-            Polygon buffered = bufferPolyline(coords, hw);
-            if (buffered.points.size() >= 3) {
-                data.geometries[class_idx].push_back(buffered);
-                polyline_count++;
-            }
-        }
-    }
-    
-    int total_point_features = 0;
-    for (const auto& kv : data.point_features) {
-        total_point_features += static_cast<int>(kv.second.size());
-    }
-    std::cout << "Loaded OSM XML: " 
-              << polygon_count << " polygons, "
-              << polyline_count << " buffered polylines, "
-              << total_point_features << " point features" << std::endl;
-    
-    return data;
-}
-
-OSMData loadOSM(const std::string& filename,
-                const Config& config) {
-    if (filename.size() >= 4 && filename.substr(filename.size() - 4) == ".osm") {
-        return loadOSMXML(filename, config);
-    } else {
-        return loadOSMBinary(filename, config.osm_class_map, config.osm_categories);
-    }
-}
-
-Config loadConfigFromYAML(const std::string& config_path) {
-    Config config;
-    try {
-        yaml_parser::YAMLNode yaml;
-        yaml.parseFile(config_path);
-
-        config.labels = yaml.getLabels();
-        config.confusion_matrix = yaml.getConfusionMatrix();
-        config.label_to_matrix_idx = yaml.getLabelToMatrixIdx();
-        config.osm_class_map = yaml.getOSMClassMap();
-        config.osm_categories = yaml.getOSMCategories();
-
-        auto height_filter_str = yaml.getOSMHeightFilter();
-        for (const auto& kv : height_filter_str) {
-            auto it = config.osm_class_map.find(kv.first);
-            if (it != config.osm_class_map.end()) {
-                config.height_filter_map[it->second] = kv.second;
-            }
-        }
-
-        std::vector<int> all_classes;
-        for (const auto& kv : config.labels) {
-            all_classes.push_back(kv.first);
-        }
-        for (size_t i = 0; i < all_classes.size(); i++) {
-            config.raw_to_dense[all_classes[i]] = static_cast<int>(i);
-            config.dense_to_raw[static_cast<int>(i)] = all_classes[i];
-        }
-        config.num_total_classes = static_cast<int>(all_classes.size());
-
-        auto scalar_it = yaml.scalars.find("osm_origin_lat");
-        if (scalar_it != yaml.scalars.end()) {
-            config.osm_origin_lat = std::stod(scalar_it->second);
-            auto lon_it = yaml.scalars.find("osm_origin_lon");
-            if (lon_it != yaml.scalars.end()) {
-                config.osm_origin_lon = std::stod(lon_it->second);
-                config.has_osm_origin = true;
-            }
-        }
-        auto offset_x_it = yaml.scalars.find("osm_world_offset_x");
-        if (offset_x_it != yaml.scalars.end()) {
-            config.osm_world_offset_x = std::stod(offset_x_it->second);
-        }
-        auto offset_y_it = yaml.scalars.find("osm_world_offset_y");
-        if (offset_y_it != yaml.scalars.end()) {
-            config.osm_world_offset_y = std::stod(offset_y_it->second);
-        }
-
-    } catch (const std::exception& e) {
-        std::cerr << "Error loading config from " << config_path << ": " << e.what() << std::endl;
-        throw;
-    }
-    return config;
-}
+// Moved to osm_loader.cpp
 
 } // namespace continuous_bki

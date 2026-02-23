@@ -12,13 +12,12 @@ Features:
 
 Example:
     >>> import composite_bki_cpp
-    >>> refined = composite_bki_cpp.run_pipeline(
-    ...     lidar_path="scan.bin",
-    ...     label_path="labels.label",
+    >>> bki = composite_bki_cpp.PyContinuousBKI(
     ...     osm_path="osm_map.bin",
-    ...     config_path="configs/mcd_config.yaml",
-    ...     output_path="refined.label"
+    ...     config_path="configs/mcd_config.yaml"
     ... )
+    >>> bki.update(labels, points)
+    >>> refined = bki.infer(points)
 
 Command-line usage:
     $ composite-bki --scan scan.bin --label labels.label --osm map.bin --output refined.label
@@ -32,13 +31,13 @@ __license__ = "MIT"
 try:
     import composite_bki_cpp
     from composite_bki_cpp import (
-        PySemanticBKI,
-        run_pipeline
+        PyContinuousBKI,
+        latlon_to_mercator
     )
     
     __all__ = [
-        'PySemanticBKI',
-        'run_pipeline',
+        'PyContinuousBKI',
+        'latlon_to_mercator',
         '__version__',
     ]
     

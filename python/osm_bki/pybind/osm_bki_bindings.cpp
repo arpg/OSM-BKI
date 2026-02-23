@@ -1,6 +1,6 @@
 /**
  * Python bindings for OSM-S-BKI (composite_bki_cpp).
- * Exposes run_pipeline and PySemanticBKI for use by basic_usage.py and other scripts.
+ * Exposes PyContinuousBKI matching the Cython bindings.pyx API
  */
 
 #include <pybind11/pybind11.h>
@@ -9,14 +9,12 @@
 
 #include <string>
 #include <vector>
-#include <fstream>
 #include <unordered_map>
-#include <cmath>
 #include <algorithm>
 
-// OSM-S-BKI core (relative to cpp/osm_bki)
 #include "continuous_bki.hpp"
-#include "file_io.hpp"
+#include "osm_loader.hpp"
+#include "osm_xml_parser.hpp"
 
 namespace py = pybind11;
 
@@ -24,18 +22,8 @@ namespace {
 
 using namespace continuous_bki;
 
-// Write refined labels to a binary file (uint32 per label)
-bool writeLabelsBin(const std::string& path, const std::vector<uint32_t>& labels) {
-    std::ofstream file(path, std::ios::binary);
-    if (!file.is_open()) return false;
-    file.write(reinterpret_cast<const char*>(labels.data()),
-               static_cast<std::streamsize>(labels.size() * sizeof(uint32_t)));
-    return true;
-}
-
-// Compute accuracy and mIoU between predicted and ground truth labels
 void compute_metrics(const uint32_t* refined, const uint32_t* gt, size_t n,
-                    double& accuracy, double& miou) {
+                     double& accuracy, double& miou) {
     size_t correct = 0;
     for (size_t i = 0; i < n; ++i)
         if (refined[i] == gt[i]) ++correct;
@@ -44,12 +32,7 @@ void compute_metrics(const uint32_t* refined, const uint32_t* gt, size_t n,
     std::unordered_map<uint32_t, int64_t> tp, fp, fn;
     for (size_t i = 0; i < n; ++i) {
         uint32_t r = refined[i], g = gt[i];
-        if (r == g) {
-            tp[r] += 1;
-        } else {
-            fp[r] += 1;
-            fn[g] += 1;
-        }
+        if (r == g) { tp[r] += 1; } else { fp[r] += 1; fn[g] += 1; }
     }
     std::unordered_map<uint32_t, int64_t> all_classes;
     for (const auto& kv : tp) all_classes[kv.first];
@@ -72,141 +55,154 @@ void compute_metrics(const uint32_t* refined, const uint32_t* gt, size_t n,
     miou = num_classes > 0 ? sum_iou / static_cast<double>(num_classes) : 0.0;
 }
 
-// Build ContinuousBKI with defaults used by the Python API
-ContinuousBKI make_bki(const Config& config, const OSMData& osm_data,
-                       float l_scale, float sigma_0, float prior_delta, int num_threads) {
-    const float resolution = 0.1f;
-    const float height_sigma = 0.3f;
-    const bool use_semantic_kernel = true;
-    const bool use_spatial_kernel = true;
-    const float alpha0 = 1.0f;
-    const bool seed_osm_prior = true;
-    const float osm_prior_strength = 1.0f;
-    const bool osm_fallback_in_infer = true;
-    const float lambda_min = 0.8f;
-    const float lambda_max = 0.99f;
-
-    return ContinuousBKI(config, osm_data,
-                          resolution, l_scale, sigma_0, prior_delta, height_sigma,
-                          use_semantic_kernel, use_spatial_kernel,
-                          num_threads, alpha0,
-                          seed_osm_prior, osm_prior_strength, osm_fallback_in_infer,
-                          lambda_min, lambda_max);
+std::vector<Point3D> array_to_points(const py::buffer_info& pb) {
+    size_t n = static_cast<size_t>(pb.shape[0]);
+    const float* px = static_cast<const float*>(pb.ptr);
+    // Use strides to support C-order, F-order, and arbitrary views (e.g. scan[:, :3] or transform output)
+    py::ssize_t s0 = pb.strides[0] / static_cast<py::ssize_t>(sizeof(float));
+    py::ssize_t s1 = pb.strides[1] / static_cast<py::ssize_t>(sizeof(float));
+    std::vector<Point3D> pts(n);
+    for (size_t i = 0; i < n; ++i)
+        pts[i] = Point3D(px[i * s0 + 0 * s1], px[i * s0 + 1 * s1], px[i * s0 + 2 * s1]);
+    return pts;
 }
 
 }  // namespace
 
-// --- run_pipeline: load scan + labels, run BKI, optionally evaluate and save
-py::array_t<uint32_t> run_pipeline(
-    const std::string& lidar_path,
-    const std::string& label_path,
-    const std::string& osm_path,
-    const std::string& config_path,
-    py::object ground_truth_path,  // None or str
-    const std::string& output_path,
-    float l_scale,
-    float sigma_0,
-    float prior_delta,
-    float alpha_0,
-    int num_threads) {
 
-    Config config = loadConfigFromYAML(config_path);
-    OSMData osm_data = loadOSM(osm_path, config);
-
-    std::vector<Point3D> points;
-    std::vector<uint32_t> labels;
-    if (!readPointCloudBin(lidar_path, points) || !readLabelBin(label_path, labels)) {
-        throw std::runtime_error("Failed to load lidar or labels: " + lidar_path + " / " + label_path);
-    }
-    if (points.size() != labels.size()) {
-        throw std::runtime_error("Point and label count mismatch");
-    }
-
-    ContinuousBKI bki = make_bki(config, osm_data, l_scale, sigma_0, prior_delta, num_threads);
-    bki.update(labels, points);
-    std::vector<uint32_t> refined = bki.infer(points);
-
-    if (!output_path.empty()) {
-        if (!writeLabelsBin(output_path, refined)) {
-            throw std::runtime_error("Failed to write output: " + output_path);
-        }
-    }
-
-    bool has_gt = !ground_truth_path.is_none();
-    if (has_gt) {
-        std::string gt_path = py::cast<std::string>(ground_truth_path);
-        std::vector<uint32_t> gt;
-        if (readLabelBin(gt_path, gt) && gt.size() == refined.size()) {
-            double acc, miou;
-            compute_metrics(refined.data(), gt.data(), refined.size(), acc, miou);
-            std::cout << "Accuracy: " << (acc * 100.0) << "%, mIoU: " << (miou * 100.0) << "%" << std::endl;
-        }
-    }
-
-    py::array_t<uint32_t> out(static_cast<py::ssize_t>(refined.size()));
-    py::buffer_info buf = out.request();
-    uint32_t* ptr = static_cast<uint32_t*>(buf.ptr);
-    std::copy(refined.begin(), refined.end(), ptr);
-    return out;
-}
-
-// --- PySemanticBKI: wrapper class for script API
-class PySemanticBKI {
+// --- PyContinuousBKI: matches the PyContinuousBKI class in bindings.pyx
+class PyContinuousBKI {
 public:
-    PySemanticBKI(const std::string& osm_path,
-                  const std::string& config_path,
-                  float l_scale = 3.0f,
-                  float sigma_0 = 1.0f,
-                  float prior_delta = 5.0f,
-                  int num_threads = -1)
+    PyContinuousBKI(const std::string& osm_path,
+                    const std::string& config_path,
+                    float resolution = 0.1f,
+                    float l_scale = 0.3f,
+                    float sigma_0 = 1.0f,
+                    float prior_delta = 5.0f,
+                    float height_sigma = 0.3f,
+                    bool use_semantic_kernel = true,
+                    bool use_spatial_kernel = true,
+                    int num_threads = -1,
+                    float alpha0 = 1.0f,
+                    bool seed_osm_prior = false,
+                    float osm_prior_strength = 0.0f,
+                    bool osm_fallback_in_infer = true,
+                    float lambda_min = 0.8f,
+                    float lambda_max = 0.99f)
         : config_(loadConfigFromYAML(config_path)),
           osm_data_(loadOSM(osm_path, config_)),
-          bki_(make_bki(config_, osm_data_, l_scale, sigma_0, prior_delta, num_threads)) {}
+          bki_(config_, osm_data_,
+               resolution, l_scale, sigma_0, prior_delta, height_sigma,
+               use_semantic_kernel, use_spatial_kernel, num_threads,
+               alpha0, seed_osm_prior, osm_prior_strength, osm_fallback_in_infer,
+               lambda_min, lambda_max) {}
 
-    py::array_t<uint32_t> process_point_cloud(py::array_t<float> points,
-                                              py::array_t<uint32_t> labels,
-                                              float alpha_0 = 0.01f) {
+    // Hard labels update: update(labels, points) — labels first, matching Cython arg order
+    void update(py::array_t<uint32_t> labels, py::array_t<float> points) {
         py::buffer_info pb = points.request();
         py::buffer_info lb = labels.request();
         if (pb.ndim != 2 || pb.shape[1] < 3)
-            throw std::runtime_error("points must be (N, 3) or (N, 4) float32");
+            throw std::runtime_error("points must be (N, 3+) float32");
         if (lb.ndim != 1)
             throw std::runtime_error("labels must be (N,) uint32");
         size_t n = static_cast<size_t>(pb.shape[0]);
         if (lb.shape[0] != static_cast<py::ssize_t>(n))
-            throw std::runtime_error("points and labels length mismatch");
+            throw std::runtime_error("labels and points length mismatch");
 
-        const float* px = static_cast<const float*>(pb.ptr);
-        const uint32_t* lx = static_cast<const uint32_t*>(lb.ptr);
-        std::vector<Point3D> pts(n);
         std::vector<uint32_t> lbls(n);
-        for (size_t i = 0; i < n; ++i) {
-            pts[i] = Point3D(px[i * pb.shape[1]], px[i * pb.shape[1] + 1], px[i * pb.shape[1] + 2]);
-            lbls[i] = lx[i];
-        }
-        (void)alpha_0;  // BKI uses internal alpha0 from config; kept for API compatibility
-        bki_.update(lbls, pts);
-        std::vector<uint32_t> refined = bki_.infer(pts);
+        const char* lbl_base = static_cast<const char*>(lb.ptr);
+        for (size_t i = 0; i < n; ++i)
+            lbls[i] = *reinterpret_cast<const uint32_t*>(lbl_base + i * lb.strides[0]);
+        bki_.update(lbls, array_to_points(pb));
+    }
 
-        py::array_t<uint32_t> out(static_cast<py::ssize_t>(refined.size()));
-        py::buffer_info ob = out.request();
-        uint32_t* out_ptr = static_cast<uint32_t*>(ob.ptr);
-        std::copy(refined.begin(), refined.end(), out_ptr);
+    // Soft/probabilistic update: update_soft(probs, points, weights=None)
+    void update_soft(py::array_t<float> probs, py::array_t<float> points,
+                     py::object weights = py::none()) {
+        py::buffer_info pb = points.request();
+        py::buffer_info rb = probs.request();
+        if (pb.ndim != 2 || pb.shape[1] < 3)
+            throw std::runtime_error("points must be (N, 3+) float32");
+        if (rb.ndim != 2)
+            throw std::runtime_error("probs must be (N, num_classes) float32");
+        size_t n = static_cast<size_t>(pb.shape[0]);
+        if (rb.shape[0] != static_cast<py::ssize_t>(n))
+            throw std::runtime_error("probs and points length mismatch");
+
+        const float* rx = static_cast<const float*>(rb.ptr);
+        int num_classes = static_cast<int>(rb.shape[1]);
+        py::ssize_t r0 = rb.strides[0] / static_cast<py::ssize_t>(sizeof(float));
+        py::ssize_t r1 = rb.strides[1] / static_cast<py::ssize_t>(sizeof(float));
+        std::vector<std::vector<float>> cpp_probs(n);
+        for (size_t i = 0; i < n; ++i) {
+            cpp_probs[i].reserve(num_classes);
+            for (int j = 0; j < num_classes; ++j)
+                cpp_probs[i].push_back(rx[i * r0 + j * r1]);
+        }
+
+        std::vector<float> cpp_weights;
+        if (!weights.is_none()) {
+            py::array_t<float> w = py::cast<py::array_t<float>>(weights);
+            py::buffer_info wb = w.request();
+            if (wb.ndim != 1 || wb.shape[0] != static_cast<py::ssize_t>(n))
+                throw std::runtime_error("weights must be (N,) float32");
+            cpp_weights.resize(n);
+            for (size_t i = 0; i < n; ++i)
+                cpp_weights[i] = *reinterpret_cast<const float*>(
+                    static_cast<const char*>(wb.ptr) + i * wb.strides[0]);
+        }
+
+        bki_.update(cpp_probs, array_to_points(pb), cpp_weights);
+    }
+
+    // Hard label inference: infer(points) -> (N,) uint32
+    py::array_t<uint32_t> infer(py::array_t<float> points) {
+        py::buffer_info pb = points.request();
+        if (pb.ndim != 2 || pb.shape[1] < 3)
+            throw std::runtime_error("points must be (N, 3+) float32");
+        size_t n = static_cast<size_t>(pb.shape[0]);
+        std::vector<uint32_t> result = bki_.infer(array_to_points(pb));
+
+        py::array_t<uint32_t> out(static_cast<py::ssize_t>(n));
+        std::copy(result.begin(), result.end(), static_cast<uint32_t*>(out.request().ptr));
         return out;
     }
 
+    // Probability inference: infer_probs(points) -> (N, num_classes) float32
+    py::array_t<float> infer_probs(py::array_t<float> points) {
+        py::buffer_info pb = points.request();
+        if (pb.ndim != 2 || pb.shape[1] < 3)
+            throw std::runtime_error("points must be (N, 3+) float32");
+        size_t n = static_cast<size_t>(pb.shape[0]);
+        std::vector<std::vector<float>> result = bki_.infer_probs(array_to_points(pb));
+
+        if (result.empty() || result[0].empty())
+            return py::array_t<float>(std::vector<py::ssize_t>{0, 0});
+
+        size_t num_classes = result[0].size();
+        py::array_t<float> out({(py::ssize_t)n, (py::ssize_t)num_classes});
+        float* out_ptr = static_cast<float*>(out.request().ptr);
+        for (size_t i = 0; i < n; ++i)
+            for (size_t j = 0; j < num_classes; ++j)
+                out_ptr[i * num_classes + j] = result[i][j];
+        return out;
+    }
+
+    int get_size() { return bki_.size(); }
+    void clear() { bki_.clear(); }
+    void save(const std::string& filename) { bki_.save(filename); }
+    void load(const std::string& filename) { bki_.load(filename); }
+
+    // evaluate_metrics: convenience method not in Cython but non-conflicting
     py::dict evaluate_metrics(py::array_t<uint32_t> refined, py::array_t<uint32_t> gt) {
         py::buffer_info rb = refined.request();
         py::buffer_info gb = gt.request();
-        if (rb.ndim != 1 || gb.ndim != 1 || rb.shape[0] != gb.shape[0]) {
+        if (rb.ndim != 1 || gb.ndim != 1 || rb.shape[0] != gb.shape[0])
             throw std::runtime_error("refined and gt must be 1D arrays of same length");
-        }
-        size_t n = static_cast<size_t>(rb.shape[0]);
-        const uint32_t* rp = static_cast<const uint32_t*>(rb.ptr);
-        const uint32_t* gp = static_cast<const uint32_t*>(gb.ptr);
         double accuracy, miou;
-        compute_metrics(rp, gp, n, accuracy, miou);
-
+        compute_metrics(static_cast<const uint32_t*>(rb.ptr),
+                        static_cast<const uint32_t*>(gb.ptr),
+                        static_cast<size_t>(rb.shape[0]), accuracy, miou);
         py::dict d;
         d["accuracy"] = accuracy;
         d["miou"] = miou;
@@ -222,35 +218,62 @@ private:
 PYBIND11_MODULE(composite_bki_cpp, m) {
     m.doc() = "OSM-S-BKI / Composite BKI C++ extension: semantic BKI with OSM priors";
 
-    m.def("run_pipeline", &run_pipeline,
-          py::arg("lidar_path"),
-          py::arg("label_path"),
-          py::arg("osm_path"),
-          py::arg("config_path"),
-          py::arg("ground_truth_path") = py::none(),
-          py::arg("output_path") = "",
-          py::arg("l_scale") = 3.0f,
-          py::arg("sigma_0") = 1.0f,
-          py::arg("prior_delta") = 5.0f,
-          py::arg("alpha_0") = 0.01f,
-          py::arg("num_threads") = -1,
-          "Run full pipeline: load scan/labels, refine with BKI, optionally evaluate and save.");
+    m.def("latlon_to_mercator",
+          [](double lat, double lon, double origin_lat, double origin_lon,
+             double world_offset_x, double world_offset_y) {
+              auto xy = osm_xml_parser::latlon_to_mercator(
+                  lat, lon, origin_lat, origin_lon, world_offset_x, world_offset_y);
+              return py::make_tuple(xy.first, xy.second);
+          },
+          py::arg("lat"), py::arg("lon"),
+          py::arg("origin_lat"), py::arg("origin_lon"),
+          py::arg("world_offset_x") = 0.0, py::arg("world_offset_y") = 0.0,
+          "Convert lat/lon to local metres using scaled Mercator projection.");
 
-    py::class_<PySemanticBKI>(m, "PySemanticBKI")
-        .def(py::init<const std::string&, const std::string&, float, float, float, int>(),
+    py::class_<PyContinuousBKI>(m, "PyContinuousBKI")
+        .def(py::init<const std::string&, const std::string&,
+                      float, float, float, float, float,
+                      bool, bool, int,
+                      float, bool, float, bool, float, float>(),
              py::arg("osm_path"),
              py::arg("config_path"),
-             py::arg("l_scale") = 3.0f,
+             py::arg("resolution") = 0.1f,
+             py::arg("l_scale") = 0.3f,
              py::arg("sigma_0") = 1.0f,
              py::arg("prior_delta") = 5.0f,
-             py::arg("num_threads") = -1)
-        .def("process_point_cloud", &PySemanticBKI::process_point_cloud,
+             py::arg("height_sigma") = 0.3f,
+             py::arg("use_semantic_kernel") = true,
+             py::arg("use_spatial_kernel") = true,
+             py::arg("num_threads") = -1,
+             py::arg("alpha0") = 1.0f,
+             py::arg("seed_osm_prior") = false,
+             py::arg("osm_prior_strength") = 0.0f,
+             py::arg("osm_fallback_in_infer") = true,
+             py::arg("lambda_min") = 0.8f,
+             py::arg("lambda_max") = 0.99f)
+        .def("update", &PyContinuousBKI::update,
+             py::arg("labels"), py::arg("points"),
+             "Update BKI with hard labels and points.")
+        .def("update_soft", &PyContinuousBKI::update_soft,
+             py::arg("probs"), py::arg("points"), py::arg("weights") = py::none(),
+             "Update BKI with soft label probabilities, points, and optional weights.")
+        .def("infer", &PyContinuousBKI::infer,
              py::arg("points"),
-             py::arg("labels"),
-             py::arg("alpha_0") = 0.01f,
-             "Update BKI with points/labels and return refined labels.")
-        .def("evaluate_metrics", &PySemanticBKI::evaluate_metrics,
-             py::arg("refined"),
-             py::arg("gt"),
+             "Infer hard labels for points; returns (N,) uint32 array.")
+        .def("infer_probs", &PyContinuousBKI::infer_probs,
+             py::arg("points"),
+             "Infer class probabilities for points; returns (N, num_classes) float32 array.")
+        .def("get_size", &PyContinuousBKI::get_size,
+             "Return number of voxels in the map.")
+        .def("clear", &PyContinuousBKI::clear,
+             "Clear the BKI map.")
+        .def("save", &PyContinuousBKI::save,
+             py::arg("filename"),
+             "Save the BKI map to a binary file.")
+        .def("load", &PyContinuousBKI::load,
+             py::arg("filename"),
+             "Load a BKI map from a binary file.")
+        .def("evaluate_metrics", &PyContinuousBKI::evaluate_metrics,
+             py::arg("refined"), py::arg("gt"),
              "Return dict with 'accuracy' and 'miou'.");
 }
