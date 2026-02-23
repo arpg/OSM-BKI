@@ -1,3 +1,4 @@
+import numpy as np
 
 EARTH_RADIUS_M = 6378137.0
 
