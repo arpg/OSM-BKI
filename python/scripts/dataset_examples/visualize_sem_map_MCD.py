@@ -471,7 +471,7 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
     timestamps_file = os.path.join(root_path, "lidar_bin/timestamps.txt")
     poses_file = os.path.join(root_path, "pose_inW.csv")
     gt_labels_dir = os.path.join(root_path, "gt_labels")
-    multiclass_dir = os.path.join(root_path, "inferred_labels", "cenet_semkitti", "multiclass_confidence_scores")
+    multiclass_dir = os.path.join(root_path, "inferred_labels", "cenet_mcd", "multiclass_confidence_scores")
 
     learning_map_inv = label_config["learning_map_inv"]
     label_id_to_color = label_config["color_map_rgb"]
@@ -732,14 +732,14 @@ if __name__ == '__main__':
         description="Compare GT labels vs inferred (dominant class): build maps, match via KD-tree, show accuracy. "
                     "Option to view all / correct / incorrect inferred points."
     )
-    parser.add_argument("--dataset-path", type=str, default="/media/donceykong/doncey_ssd_02/datasets/MCD")
+    parser.add_argument("--dataset-path", type=str, default="./example_data/mcd")
     parser.add_argument("--seq", type=str, nargs="+", default=["kth_day_09"], help="Sequence name(s)")
     parser.add_argument("--view", type=str, choices=["all", "correct", "incorrect"], default="all",
                         help="Show all inferred points, only correct, or only incorrect (default: all)")
-    parser.add_argument("--max-scans", type=int, default=2000, help="Max scans to process (0 or None for all)")
-    parser.add_argument("--downsample-factor", type=int, default=100, help="Process every Nth scan")
-    parser.add_argument("--voxel-size", type=float, default=2.0, help="Voxel size in meters (per-scan downsampling)")
-    parser.add_argument("--max-distance", type=float, default=100.0, help="Max distance from pose to keep points (m)")
+    parser.add_argument("--max-scans", type=int, default=10000, help="Max scans to process (0 or None for all)")
+    parser.add_argument("--downsample-factor", type=int, default=1, help="Process every Nth scan")
+    parser.add_argument("--voxel-size", type=float, default=0.5, help="Voxel size in meters (per-scan downsampling)")
+    parser.add_argument("--max-distance", type=float, default=200.0, help="Max distance from pose to keep points (m)")
     parser.add_argument("--config", type=str, default=None, help="Path to MCD label config YAML (default: ce_net/config/data_cfg_mcd.yaml)")
     parser.add_argument("--variance", action="store_true", help="Color by variance of class probabilities (Viridis: yellow=uncertain, dark=confident)")
     parser.add_argument("--use-second-above-median", action="store_true",
