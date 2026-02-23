@@ -9,8 +9,8 @@
 
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <algorithm>
+#include "ankerl/unordered_dense.h"
 
 #include "continuous_bki.hpp"
 #include "osm_loader.hpp"
@@ -30,12 +30,12 @@ void compute_metrics(const uint32_t* refined, const uint32_t* gt, size_t n,
         if (refined[i] == gt[i]) ++correct;
     accuracy = n > 0 ? static_cast<double>(correct) / static_cast<double>(n) : 0.0;
 
-    std::unordered_map<uint32_t, int64_t> tp, fp, fn;
+    ankerl::unordered_dense::map<uint32_t, int64_t> tp, fp, fn;
     for (size_t i = 0; i < n; ++i) {
         uint32_t r = refined[i], g = gt[i];
         if (r == g) { tp[r] += 1; } else { fp[r] += 1; fn[g] += 1; }
     }
-    std::unordered_map<uint32_t, int64_t> all_classes;
+    ankerl::unordered_dense::map<uint32_t, int64_t> all_classes;
     for (const auto& kv : tp) all_classes[kv.first];
     for (const auto& kv : fp) all_classes[kv.first];
     for (const auto& kv : fn) all_classes[kv.first];

@@ -5,7 +5,7 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
-#include <unordered_map>
+#include "ankerl/unordered_dense.h"
 #include <vector>
 
 #include <Eigen/Dense>
@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
         init_rel_pos(2) = map_config.init_rel_pos_z;
     }
 
-    std::unordered_map<int, Eigen::Matrix4d> lidar_to_map_by_scan_id;
+    ankerl::unordered_dense::map<int, Eigen::Matrix4d> lidar_to_map_by_scan_id;
     lidar_to_map_by_scan_id.reserve(poses.size());
 
     for (const auto& pose : poses) {

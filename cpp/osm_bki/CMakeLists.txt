@@ -18,6 +18,7 @@ set(osm_bki_CORE_SOURCES
     src/continuous_bki.cpp
     src/file_io.cpp
     src/dataset_utils.cpp
+    src/osm_loader.cpp
 )
 
 add_library(osm_bki_core STATIC ${osm_bki_CORE_SOURCES})
@@ -96,7 +97,7 @@ if(osm_bki_BUILD_PCL_EXAMPLES)
 
     if(PCL_FOUND AND LIBOSMIUM_FOUND)
         message(STATUS "Adding example: visualize_map_osm")
-        add_executable(visualize_map_osm examples/visualize_map_osm.cpp src/osm_parser.cpp)
+        add_executable(visualize_map_osm examples/visualize_map_osm.cpp)
         target_include_directories(visualize_map_osm PRIVATE ${Boost_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS} ${LIBOSMIUM_INCLUDE_DIRS})
         target_link_libraries(visualize_map_osm PRIVATE osm_bki_core ${PCL_LIBRARIES} expat bz2 z)
         if(TARGET Boost::headers)

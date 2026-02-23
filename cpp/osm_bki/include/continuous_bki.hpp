@@ -11,7 +11,7 @@
 
 #include <vector>
 #include <map>
-#include <unordered_map>
+#include "ankerl/unordered_dense.h"
 #include <string>
 #include <cmath>
 #include <algorithm>
@@ -106,6 +106,8 @@ struct Block {
     int last_updated = 0;
 };
 
+using BlockMap = ankerl::unordered_dense::map<BlockKey, Block, BlockKeyHasher>;
+
 // --- Main Class ---
 class ContinuousBKI {
 public:
@@ -165,12 +167,12 @@ public:
     int getShardIndex(const BlockKey& bk) const;
 
     // block allocator/accessor (buffer versions avoid heap allocs during seeding)
-    Block& getOrCreateBlock(std::unordered_map<BlockKey, Block, BlockKeyHasher>& shard_map,
+    Block& getOrCreateBlock(BlockMap& shard_map,
                             const BlockKey& bk,
                             std::vector<float>& buf_m_i,
                             std::vector<float>& buf_p_super,
                             std::vector<float>& buf_p_pred) const;
-    const Block* getBlockConst(const std::unordered_map<BlockKey, Block, BlockKeyHasher>& shard_map, const BlockKey& bk) const;
+    const Block* getBlockConst(const BlockMap& shard_map, const BlockKey& bk) const;
 
     // Prior seeding (Dirichlet base + optional OSM mapped prior)
     void initVoxelAlpha(Block& b, int lx, int ly, int lz, const Point3D& center,
@@ -246,7 +248,7 @@ private:
     OSMData osm_data_;
 
     // Backend: sharded block hash maps
-    std::vector<std::unordered_map<BlockKey, Block, BlockKeyHasher>> block_shards_;
+    std::vector<BlockMap> block_shards_;
 
     // Params
     float resolution_;

@@ -109,6 +109,7 @@ ext = Extension(
     include_dirs=[
         get_pybind_include(),
         *get_include_dirs(),
+        "/usr/include/eigen3",
     ],
     language="c++",
     extra_compile_args=extra_compile_args(),

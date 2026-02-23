@@ -346,7 +346,7 @@ void ContinuousBKI::voxelToLocal(const VoxelKey& vk, int& lx, int& ly, int& lz) 
 
 // getOrCreateBlock with pre-allocated buffers to avoid heap allocs during OSM seeding
 Block& ContinuousBKI::getOrCreateBlock(
-        std::unordered_map<BlockKey, Block, BlockKeyHasher>& shard_map,
+        BlockMap& shard_map,
         const BlockKey& bk,
         std::vector<float>& buf_m_i,
         std::vector<float>& buf_p_super,
@@ -381,7 +381,7 @@ Block& ContinuousBKI::getOrCreateBlock(
     return inserted.first->second;
 }
 
-const Block* ContinuousBKI::getBlockConst(const std::unordered_map<BlockKey, Block, BlockKeyHasher>& shard_map, const BlockKey& bk) const {
+const Block* ContinuousBKI::getBlockConst(const BlockMap& shard_map, const BlockKey& bk) const {
     auto it = shard_map.find(bk);
     if (it == shard_map.end()) return nullptr;
     return &it->second;
