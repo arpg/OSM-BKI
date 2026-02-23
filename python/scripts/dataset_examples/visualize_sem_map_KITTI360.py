@@ -6,6 +6,10 @@ Loads LiDAR scans and semantic labels, transforms to world frame using poses,
 and displays the accumulated point cloud colored by semantic class.
 Optionally overlays OSM building/road outlines and the drive path.
 
+With --use-multiclass, loads multiclass confidence scores instead of one-hot
+labels, computes accuracy vs GT, and reports uncertainty analysis
+(before/after removing uncertain points, Spearman correlation, AUROC).
+
     Usage:
         python visualize_sem_map_KITTI360.py
         python visualize_sem_map_KITTI360.py --sequence 2 --scan-skip 5 --downsample 0.2
@@ -23,6 +27,12 @@ from collections import defaultdict
 
 import numpy as np
 import open3d as o3d
+import yaml
+from scipy.spatial import cKDTree
+from scipy.stats import rankdata, spearmanr
+import matplotlib.pyplot as plt
+
+from utils import *
 
 # Default paths
 KITTI360_ROOT = "./example_data/kitti360"
@@ -110,6 +120,85 @@ def get_label_id_to_color(labels_list):
 LABEL_ID_TO_COLOR = get_label_id_to_color(KITTI360_LABELS)
 # Default color for unknown label IDs (gray)
 UNKNOWN_COLOR = np.array([0.5, 0.5, 0.5], dtype=np.float64)
+
+# ---------------------------------------------------------------------------
+# Label config + multiclass helpers
+# ---------------------------------------------------------------------------
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LABEL_CONFIG_PATHS = {
+    "kitti360": os.path.join(_SCRIPT_DIR, "labels_kitti360.yaml"),
+    "semkitti": os.path.join(_SCRIPT_DIR, "labels_semkitti.yaml"),
+}
+INFERRED_SUBDIRS = {
+    "kitti360": "cenet_kitti360",
+    "semkitti": "cenet_semkitti",
+}
+
+
+def load_label_config(config_path):
+    """Load learning_map and learning_map_inv from a label YAML config."""
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    learning_map = {int(k): int(v) for k, v in cfg.get("learning_map", {}).items()}
+    learning_map_inv = {int(k): int(v) for k, v in cfg.get("learning_map_inv", {}).items()}
+    return {"learning_map": learning_map, "learning_map_inv": learning_map_inv}
+
+
+def map_class_indices_to_labels(class_indices, learning_map_inv):
+    """Map class indices (0..n_classes-1) to semantic label IDs via learning_map_inv."""
+    maxkey = max(learning_map_inv.keys(), default=0)
+    lut = np.zeros((maxkey + 100), dtype=np.int32)
+    for key, value in learning_map_inv.items():
+        try:
+            lut[int(key)] = int(value)
+        except IndexError:
+            pass
+    return lut[class_indices]
+
+
+def map_labels_to_class_indices(labels, learning_map):
+    """Map raw label IDs to class indices via learning_map. Unknown labels map to 0."""
+    maxkey = max(learning_map.keys(), default=0)
+    lut = np.zeros((maxkey + 100), dtype=np.int32)
+    for key, value in learning_map.items():
+        try:
+            lut[int(key)] = int(value)
+        except IndexError:
+            pass
+    safe = np.clip(labels.astype(np.int64), 0, len(lut) - 1)
+    return lut[safe]
+
+
+# Viridis colormap LUT (dark purple/blue -> green -> yellow)
+_VIRIDIS_KEY = np.array([
+    [0.267004, 0.004874, 0.329415],
+    [0.282327, 0.140926, 0.457517],
+    [0.127568, 0.566949, 0.550556],
+    [0.369214, 0.788888, 0.383287],
+    [0.993248, 0.906157, 0.143936],
+], dtype=np.float32)
+_VIRIDIS_LUT = np.zeros((256, 3), dtype=np.float32)
+for _i in range(256):
+    _t = _i / 255.0
+    _idx = _t * 4
+    _j = int(np.clip(np.floor(_idx), 0, 3))
+    _u = _idx - _j
+    _VIRIDIS_LUT[_i] = (1 - _u) * _VIRIDIS_KEY[_j] + _u * _VIRIDIS_KEY[_j + 1]
+
+
+def scalar_to_viridis_rgb(values, normalize_range=True):
+    """Map scalar values to RGB using Viridis (dark = low, yellow = high). Returns (N, 3) in [0,1]."""
+    v = np.asarray(values, dtype=np.float32).reshape(-1)
+    if normalize_range:
+        vmin, vmax = np.min(v), np.max(v)
+        rng = vmax - vmin
+        if rng <= 0:
+            rng = 1.0
+        v = (v - vmin) / rng
+    v = np.clip(v, 0.0, 1.0)
+    idx = np.clip((v * 255).astype(np.int32), 0, 255)
+    return _VIRIDIS_LUT[idx].copy()
+
 
 # ---------------------------------------------------------------------------
 # OSM overlay constants
@@ -376,6 +465,274 @@ def build_semantic_map(
     return points, colors
 
 
+def build_multiclass_map(
+    kitti360_root,
+    sequence_index=0,
+    labels_key="kitti360",
+    learning_map=None,
+    learning_map_inv=None,
+    scan_skip=1,
+    voxel_size=0.15,
+    max_range=None,
+    max_points=None,
+    view_variance=False,
+):
+    """
+    Load scans, GT labels, and multiclass confidence scores for one sequence.
+    Returns dict with gt_points, gt_labels, inf_labels, inf_labels_second,
+    inf_variance, and optionally inf_uncertainty arrays for accuracy analysis.
+    """
+    seq_dir = f"2013_05_28_drive_{sequence_index:04d}_sync"
+    paths = get_sequence_paths(kitti360_root, sequence_index)
+    raw_pc_dir = paths["raw_pc_dir"]
+
+    infer_subdir = INFERRED_SUBDIRS.get(labels_key, f"cenet_{labels_key}")
+
+    # Resolve GT label dir
+    gt_label_dir = os.path.join(kitti360_root, seq_dir, "gt_labels")
+    if not os.path.isdir(gt_label_dir):
+        gt_label_dir = os.path.join(kitti360_root, "data_3d_semantics", seq_dir, "gt_labels")
+
+    # Resolve multiclass confidence scores dir
+    multiclass_dir = os.path.join(kitti360_root, seq_dir, "inferred_labels", infer_subdir, "multiclass_confidence_scores")
+    if not os.path.isdir(multiclass_dir):
+        multiclass_dir = os.path.join(kitti360_root, "data_3d_semantics", seq_dir, "inferred_labels", infer_subdir, "multiclass_confidence_scores")
+
+    if not os.path.isdir(raw_pc_dir):
+        raise FileNotFoundError(f"Raw LiDAR directory not found: {raw_pc_dir}")
+    if not os.path.isdir(gt_label_dir):
+        raise FileNotFoundError(f"GT labels directory not found: {gt_label_dir}")
+    if not os.path.isdir(multiclass_dir):
+        raise FileNotFoundError(f"Multiclass confidence scores directory not found: {multiclass_dir}")
+
+    print(f"GT label directory: {gt_label_dir}")
+    print(f"Multiclass directory: {multiclass_dir}")
+
+    velodyne_poses = get_velodyne_poses(kitti360_root, seq_dir)
+    if not velodyne_poses:
+        raise ValueError("No poses loaded.")
+
+    min_f, max_f = find_frame_range(gt_label_dir)
+    if min_f is None:
+        raise ValueError(f"No label .bin files in {gt_label_dir}")
+
+    frame_indices = sorted(velodyne_poses.keys())
+    frame_indices = [f for f in frame_indices if min_f <= f <= max_f]
+    if scan_skip > 1:
+        frame_indices = frame_indices[::scan_skip]
+
+    all_points = []
+    all_gt_labels = []
+    all_inf_labels = []
+    all_inf_labels_second = []
+    all_inf_variance = []
+    all_inf_uncertainty = []
+
+    for frame_id in frame_indices:
+        pose = velodyne_poses.get(frame_id)
+        if pose is None:
+            continue
+
+        pc_path = os.path.join(raw_pc_dir, f"{frame_id:010d}.bin")
+        gt_path = os.path.join(gt_label_dir, f"{frame_id:010d}.bin")
+        mc_path = os.path.join(multiclass_dir, f"{frame_id:010d}.bin")
+        if not os.path.isfile(pc_path) or not os.path.isfile(gt_path) or not os.path.isfile(mc_path):
+            continue
+
+        try:
+            pc = read_bin_file(pc_path, dtype=np.float32, shape=(-1, 4))
+            xyz = pc[:, :3]
+            gt_lbl = read_bin_file(gt_path, dtype=np.uint32, shape=(-1)).astype(np.int32)
+            raw_probs = read_bin_file(mc_path, dtype=np.float16)
+            n_points = len(xyz)
+            n_classes = len(raw_probs) // n_points
+            if len(gt_lbl) != n_points or len(raw_probs) != n_points * n_classes:
+                continue
+            multiclass_probs = raw_probs.reshape(n_points, n_classes)
+        except Exception as e:
+            print(f"  Skip frame {frame_id}: {e}", file=sys.stderr)
+            continue
+
+        # Map GT to class indices for fair comparison
+        if learning_map is not None:
+            gt_class = map_labels_to_class_indices(gt_lbl, learning_map)
+        else:
+            gt_class = gt_lbl
+
+        class_indices = np.argmax(multiclass_probs, axis=1)
+        inf_lbl = map_class_indices_to_labels(class_indices, learning_map_inv) if learning_map_inv else class_indices
+        second_class_indices = np.argsort(multiclass_probs, axis=1)[:, -2]
+        inf_lbl_second = map_class_indices_to_labels(second_class_indices, learning_map_inv) if learning_map_inv else second_class_indices
+
+        # Map GT back to label IDs too (via learning_map_inv of the mapped class indices)
+        gt_lbl_mapped = map_class_indices_to_labels(gt_class, learning_map_inv) if learning_map_inv else gt_class
+
+        variances = np.var(multiclass_probs.astype(np.float32), axis=1)
+        if view_variance:
+            max_var = (n_classes - 1) / (n_classes ** 2) if n_classes > 1 else 1.0
+            scaled = np.clip(variances / max_var, 0.0, 1.0)
+            uncertainty = 1.0 - scaled
+        else:
+            uncertainty = None
+
+        world_xyz = transform_points_to_world(xyz, pose)
+
+        if max_range is not None and max_range > 0:
+            dist = np.linalg.norm(world_xyz - pose[:3, 3], axis=1)
+            mask = dist <= max_range
+            world_xyz = world_xyz[mask]
+            gt_lbl_mapped = gt_lbl_mapped[mask]
+            inf_lbl = inf_lbl[mask]
+            inf_lbl_second = inf_lbl_second[mask]
+            variances = variances[mask]
+            if uncertainty is not None:
+                uncertainty = uncertainty[mask]
+
+        if voxel_size is not None and voxel_size > 0 and len(world_xyz) > 0:
+            scan_pcd = o3d.geometry.PointCloud()
+            scan_pcd.points = o3d.utility.Vector3dVector(world_xyz.astype(np.float64))
+            scan_pcd = scan_pcd.voxel_down_sample(voxel_size=voxel_size)
+            world_ds = np.asarray(scan_pcd.points)
+            if len(world_ds) == 0:
+                continue
+            tree_scan = cKDTree(world_xyz)
+            _, idx = tree_scan.query(world_ds, k=1)
+            gt_lbl_mapped = gt_lbl_mapped[idx]
+            inf_lbl = inf_lbl[idx]
+            inf_lbl_second = inf_lbl_second[idx]
+            variances = variances[idx]
+            if uncertainty is not None:
+                uncertainty = uncertainty[idx]
+            world_xyz = world_ds
+
+        current_total = sum(len(x) for x in all_points)
+        if max_points is not None and current_total >= max_points:
+            break
+        if max_points is not None and current_total + len(world_xyz) > max_points:
+            need = max_points - current_total
+            world_xyz = world_xyz[:need]
+            gt_lbl_mapped = gt_lbl_mapped[:need]
+            inf_lbl = inf_lbl[:need]
+            inf_lbl_second = inf_lbl_second[:need]
+            variances = variances[:need]
+            if uncertainty is not None:
+                uncertainty = uncertainty[:need]
+
+        all_points.append(world_xyz.astype(np.float64))
+        all_gt_labels.append(gt_lbl_mapped)
+        all_inf_labels.append(inf_lbl)
+        all_inf_labels_second.append(inf_lbl_second)
+        all_inf_variance.append(variances)
+        if view_variance and uncertainty is not None:
+            all_inf_uncertainty.append(uncertainty)
+
+    if not all_points:
+        return None
+
+    return {
+        "points": np.vstack(all_points),
+        "gt_labels": np.concatenate(all_gt_labels),
+        "inf_labels": np.concatenate(all_inf_labels),
+        "inf_labels_second": np.concatenate(all_inf_labels_second),
+        "inf_variance": np.concatenate(all_inf_variance),
+        "inf_uncertainty": np.concatenate(all_inf_uncertainty) if all_inf_uncertainty else None,
+        "n_classes": n_classes,
+    }
+
+
+def run_accuracy_analysis(result, use_second_above_median=False):
+    """Run accuracy analysis, uncertainty calibration, and print reports. Returns (correct, uncertainty_all)."""
+    gt_labels = result["gt_labels"]
+    inf_labels = result["inf_labels"]
+    inf_labels_second = result["inf_labels_second"]
+    inf_variance = result["inf_variance"]
+    n_classes = result["n_classes"]
+
+    correct = (inf_labels == gt_labels)
+    n_correct = int(np.sum(correct))
+    n_total = len(correct)
+    print(f"Accuracy: {n_correct}/{n_total} ({100.0 * n_correct / n_total:.2f}%)")
+
+    max_var = (n_classes - 1) / (n_classes ** 2) if n_classes > 1 else 1.0
+    scaled_var = np.clip(inf_variance / max_var, 0.0, 1.0)
+    uncertainty_all = 1.0 - scaled_var
+    median_uncertainty = float(np.median(uncertainty_all))
+    print(f"Median uncertainty: {median_uncertainty:.6f}")
+
+    modified_labels = np.where(uncertainty_all > median_uncertainty, inf_labels_second, inf_labels)
+    correct_modified = (modified_labels == gt_labels)
+    n_correct_modified = int(np.sum(correct_modified))
+    accuracy_modified = 100.0 * n_correct_modified / n_total
+    print(f"Total accuracy after switching to second-best for above-median: {n_correct_modified}/{n_total} ({accuracy_modified:.2f}%)")
+
+    if use_second_above_median:
+        n_above = int(np.sum(uncertainty_all > median_uncertainty))
+        print(f"Using second-highest class for points above median uncertainty: n={n_above} points switched")
+    else:
+        low_mask = (uncertainty_all <= median_uncertainty)
+        n_kept = int(np.sum(low_mask))
+        n_removed = n_total - n_kept
+        n_correct_kept = int(np.sum(correct[low_mask]))
+        accuracy_kept = 100.0 * n_correct_kept / n_kept if n_kept > 0 else 0.0
+        print(f"Keeping points with uncertainty <= median: n={n_kept} (removed {n_removed})")
+        print(f"Accuracy after removing high-uncertainty points: {n_correct_kept}/{n_kept} ({accuracy_kept:.2f}%)")
+
+    incorrect = np.asarray(~correct, dtype=np.float64)
+    rho, p_val = spearmanr(uncertainty_all, incorrect)
+    print(f"\n--- Uncertainty calibration ---")
+    print(f"Spearman(uncertainty, incorrect): rho = {rho:.4f} (p = {p_val:.2e})")
+
+    n_incorrect = int(np.sum(incorrect))
+    n_correct_count = n_total - n_incorrect
+    if n_incorrect > 0 and n_correct_count > 0:
+        ranks = rankdata(uncertainty_all)
+        S = np.sum(ranks[~correct])
+        auroc = (S - n_incorrect * (n_incorrect + 1) / 2) / (n_incorrect * n_correct_count)
+        print(f"AUROC(uncertainty -> predicts error): {auroc:.4f}")
+
+    n_bins = 10
+    bin_edges = np.percentile(uncertainty_all, np.linspace(0, 100, n_bins + 1))
+    bin_edges[-1] += 1e-9
+    print(f"\nAccuracy by uncertainty bin (lower bin = more confident):")
+    bin_accs = []
+    bin_centers = []
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        b = (uncertainty_all >= lo) & (uncertainty_all < hi)
+        n_b = int(np.sum(b))
+        if n_b > 0:
+            acc_b = 100.0 * np.sum(correct[b]) / n_b
+            bin_accs.append(acc_b)
+            bin_centers.append((lo + hi) / 2)
+            print(f"  bin {i+1:2d} [unc {lo:.3f}-{hi:.3f}]: acc = {acc_b:.1f}%  (n={n_b})")
+    if bin_accs:
+        fig_cal, ax_cal = plt.subplots(figsize=(7, 4))
+        ax_cal.plot(bin_centers, bin_accs, "o-", color="steelblue", linewidth=2, markersize=8)
+        ax_cal.set_xlabel("Mean uncertainty (bin)")
+        ax_cal.set_ylabel("Accuracy (%)")
+        ax_cal.set_title("Accuracy by uncertainty bin")
+        ax_cal.set_ylim(0, 105)
+        ax_cal.grid(True, alpha=0.3)
+        fig_cal.tight_layout()
+        plt.show(block=True)
+        plt.close(fig_cal)
+
+    var_all = inf_variance
+    avg_var = float(np.mean(var_all))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(var_all, bins=80, color="steelblue", edgecolor="white", alpha=0.85)
+    ax.axvline(avg_var, color="coral", linewidth=2, label=f"Mean = {avg_var:.4f}")
+    ax.set_xlabel("Variance of class probabilities")
+    ax.set_ylabel("Count")
+    ax.set_title(f"Variance distribution (n={n_total})")
+    ax.legend()
+    fig.tight_layout()
+    plt.show(block=True)
+    plt.close(fig)
+
+    return correct, uncertainty_all
+
+
 # ---------------------------------------------------------------------------
 # OSM overlay helpers
 # ---------------------------------------------------------------------------
@@ -577,7 +934,8 @@ def create_path_geometry(points_xyz, color=(0.0, 0.8, 0.0), thickness=1.5):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visualize KITTI-360 semantic map with Open3D (first sequence by default)."
+        description="Visualize KITTI-360 semantic map with Open3D. Supports one-hot labels (default) "
+                    "or multiclass confidence scores with accuracy analysis."
     )
     parser.add_argument(
         "--root",
@@ -601,7 +959,7 @@ def main():
         "--downsample",
         type=float,
         default=1.0,
-        help="Voxel size in meters for voxel downsampling (default: 0.15, use 0 to disable)",
+        help="Voxel size in meters for voxel downsampling (default: 1.0, use 0 to disable)",
     )
     parser.add_argument(
         "--max-range",
@@ -628,6 +986,15 @@ def main():
         choices=list(LABELS_OPTIONS.keys()),
         help="Label set to use for coloring (default: kitti360). Options: %(choices)s",
     )
+    # Multiclass / accuracy arguments
+    parser.add_argument("--use-multiclass", action="store_true",
+                        help="Load multiclass confidence scores instead of one-hot labels; enables accuracy analysis")
+    parser.add_argument("--variance", action="store_true",
+                        help="Color by variance of class probabilities (Viridis: yellow=uncertain, dark=confident)")
+    parser.add_argument("--view", type=str, choices=["all", "correct", "incorrect"], default="all",
+                        help="When using multiclass: show all / correct / incorrect points (default: all)")
+    parser.add_argument("--use-second-above-median", action="store_true",
+                        help="For points with uncertainty above median, use second-highest class instead of removing")
     # OSM overlay arguments
     parser.add_argument("--with-osm", action="store_true", help="Overlay OSM map on the semantic map")
     parser.add_argument("--osm-thickness", type=float, default=2.0, help="OSM line thickness in meters (default: 2.0)")
@@ -683,24 +1050,65 @@ def main():
         else:
             print(f"OSM file not found: {osm_file}", file=sys.stderr)
 
-    # -- Semantic map -----------------------------------------------------
-    print("Building semantic map...")
-    points, colors = build_semantic_map(
-        args.root,
-        sequence_index=args.sequence,
-        scan_skip=args.scan_skip,
-        voxel_size=voxel_size,
-        max_range=args.max_range,
-        max_points=args.max_points,
-    )
+    # -- Build map --------------------------------------------------------
+    if args.use_multiclass:
+        # Load label config for learning_map / learning_map_inv
+        config_path = LABEL_CONFIG_PATHS.get(args.labels)
+        if config_path is None or not os.path.isfile(config_path):
+            print(f"ERROR: Label config not found for '{args.labels}': {config_path}", file=sys.stderr)
+            sys.exit(1)
+        label_cfg = load_label_config(config_path)
 
-    if points is not None:
+        print("Building multiclass map...")
+        result = build_multiclass_map(
+            args.root,
+            sequence_index=args.sequence,
+            labels_key=args.labels,
+            learning_map=label_cfg["learning_map"],
+            learning_map_inv=label_cfg["learning_map_inv"],
+            scan_skip=args.scan_skip,
+            voxel_size=voxel_size,
+            max_range=args.max_range,
+            max_points=args.max_points,
+            view_variance=args.variance,
+        )
+
+        if result is None:
+            print("No points loaded. Check paths and sequence.", file=sys.stderr)
+            sys.exit(1)
+
+        points = result["points"]
+        inf_labels = result["inf_labels"]
+        inf_uncertainty = result["inf_uncertainty"]
+        n_total = len(points)
+        print(f"Total points: {n_total}")
+
+        # Accuracy analysis
+        correct, uncertainty_all = run_accuracy_analysis(result, use_second_above_median=args.use_second_above_median)
+
+        # Filter by view mode
+        if args.view == "correct":
+            mask = correct
+        elif args.view == "incorrect":
+            mask = ~correct
+        else:
+            mask = np.ones(n_total, dtype=bool)
+        n_show = int(np.sum(mask))
+        print(f"Showing {n_show} points (view={args.view})")
+
+        pts = points[mask]
+
+        # Color by variance or by semantic class
+        if args.variance and inf_uncertainty is not None:
+            colors = scalar_to_viridis_rgb(inf_uncertainty[mask], normalize_range=False)
+        else:
+            colors = labels_to_colors(inf_labels[mask])
+
         if first_pose_for_osm is not None and (args.with_osm or args.with_path):
-            points = points - first_pose_for_osm.astype(points.dtype)
+            pts = pts - first_pose_for_osm.astype(pts.dtype)
 
-        print(f"Total points: {len(points)}")
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.points = o3d.utility.Vector3dVector(pts)
         pcd.colors = o3d.utility.Vector3dVector(colors)
         geoms.insert(0, pcd)
 
@@ -710,8 +1118,37 @@ def main():
                 os.makedirs(out_dir, exist_ok=True)
             o3d.io.write_point_cloud(args.save, pcd)
             print(f"Saved to {args.save}")
+
     else:
-        print("No semantic points loaded. Check paths and sequence.", file=sys.stderr)
+        # Default: one-hot label mode (original behavior)
+        print("Building semantic map...")
+        points, colors = build_semantic_map(
+            args.root,
+            sequence_index=args.sequence,
+            scan_skip=args.scan_skip,
+            voxel_size=voxel_size,
+            max_range=args.max_range,
+            max_points=args.max_points,
+        )
+
+        if points is not None:
+            if first_pose_for_osm is not None and (args.with_osm or args.with_path):
+                points = points - first_pose_for_osm.astype(points.dtype)
+
+            print(f"Total points: {len(points)}")
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points)
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+            geoms.insert(0, pcd)
+
+            if args.save:
+                out_dir = os.path.dirname(os.path.abspath(args.save))
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                o3d.io.write_point_cloud(args.save, pcd)
+                print(f"Saved to {args.save}")
+        else:
+            print("No semantic points loaded. Check paths and sequence.", file=sys.stderr)
 
     if not geoms:
         print("Nothing to display.", file=sys.stderr)
