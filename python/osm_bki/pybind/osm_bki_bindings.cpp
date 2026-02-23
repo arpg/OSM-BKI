@@ -15,6 +15,7 @@
 #include "continuous_bki.hpp"
 #include "osm_loader.hpp"
 #include "osm_xml_parser.hpp"
+#include "pose_utils.hpp"
 
 namespace py = pybind11;
 
@@ -229,6 +230,71 @@ PYBIND11_MODULE(composite_bki_cpp, m) {
           py::arg("origin_lat"), py::arg("origin_lon"),
           py::arg("world_offset_x") = 0.0, py::arg("world_offset_y") = 0.0,
           "Convert lat/lon to local metres using scaled Mercator projection.");
+
+    m.def("transform_scan_to_world",
+          [](py::array_t<float> points,
+             py::array_t<double> pose,
+             py::array_t<double> body_to_lidar,
+             py::object init_rel_pos_obj) -> py::array_t<float> {
+              py::buffer_info pb = points.request();
+              if (pb.ndim != 2 || pb.shape[1] < 3)
+                  throw std::runtime_error("points must be (N, 3+) float32");
+
+              py::buffer_info poseb = pose.request();
+              if (poseb.ndim != 1 || poseb.shape[0] < 7)
+                  throw std::runtime_error("pose must be (7,) float64: [x, y, z, qx, qy, qz, qw]");
+
+              py::buffer_info cb = body_to_lidar.request();
+              if (cb.ndim != 2 || cb.shape[0] != 4 || cb.shape[1] != 4)
+                  throw std::runtime_error("body_to_lidar must be (4, 4) float64");
+
+              const double* pd = static_cast<const double*>(poseb.ptr);
+
+              continuous_bki::Transform4x4 calib;
+              const double* cd = static_cast<const double*>(cb.ptr);
+              py::ssize_t cs0 = cb.strides[0] / static_cast<py::ssize_t>(sizeof(double));
+              py::ssize_t cs1 = cb.strides[1] / static_cast<py::ssize_t>(sizeof(double));
+              for (int i = 0; i < 4; ++i)
+                  for (int j = 0; j < 4; ++j)
+                      calib.m[i * 4 + j] = cd[i * cs0 + j * cs1];
+
+              const double* irp = nullptr;
+              double irp_buf[3];
+              if (!init_rel_pos_obj.is_none()) {
+                  py::array_t<double> irp_arr = py::cast<py::array_t<double>>(init_rel_pos_obj);
+                  py::buffer_info ib = irp_arr.request();
+                  if (ib.ndim != 1 || ib.shape[0] < 3)
+                      throw std::runtime_error("init_rel_pos must be (3,) float64");
+                  const double* id = static_cast<const double*>(ib.ptr);
+                  irp_buf[0] = id[0]; irp_buf[1] = id[1]; irp_buf[2] = id[2];
+                  irp = irp_buf;
+              }
+
+              std::vector<continuous_bki::Point3D> pts = array_to_points(pb);
+              std::vector<continuous_bki::Point3D> out =
+                  continuous_bki::transformScanToWorld(
+                      pts, pd[0], pd[1], pd[2],
+                      pd[3], pd[4], pd[5], pd[6],
+                      calib, irp);
+
+              size_t n = out.size();
+              py::array_t<float> result({(py::ssize_t)n, (py::ssize_t)3});
+              float* rp = static_cast<float*>(result.request().ptr);
+              for (size_t i = 0; i < n; ++i) {
+                  rp[i * 3 + 0] = out[i].x;
+                  rp[i * 3 + 1] = out[i].y;
+                  rp[i * 3 + 2] = out[i].z;
+              }
+              return result;
+          },
+          py::arg("points"),
+          py::arg("pose"),
+          py::arg("body_to_lidar"),
+          py::arg("init_rel_pos") = py::none(),
+          "Transform LiDAR points (N,3) float32 to world frame.\n"
+          "pose: (7,) float64 [x,y,z,qx,qy,qz,qw]\n"
+          "body_to_lidar: (4,4) float64 calibration matrix\n"
+          "init_rel_pos: (3,) float64 or None -- subtracted from pose translation");
 
     py::class_<PyContinuousBKI>(m, "PyContinuousBKI")
         .def(py::init<const std::string&, const std::string&,

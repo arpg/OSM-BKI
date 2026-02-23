@@ -1,3 +1,4 @@
+import glob
 import numpy as np
 import argparse
 import os
@@ -81,7 +82,6 @@ if __name__ == "__main__":
         elif not os.path.isdir(args.output):
             raise NotADirectoryError(f"Output must be a directory if input is a directory: {args.output}")
             
-        import glob
         input_files = sorted(glob.glob(os.path.join(args.input, "*.label")))
         if not input_files:
              input_files = sorted(glob.glob(os.path.join(args.input, "*.bin")))

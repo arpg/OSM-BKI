@@ -1,16 +1,9 @@
-import composite_bki_cpp
-import numpy as np
 import sys
 import os
 
-# Add scripts directory to path to import visualize_osm
-sys.path.append(os.path.join(os.path.dirname(__file__), 'scripts'))
-try:
-    from visualize_osm import MCD_LABEL_COLORS, MCD_LABEL_NAMES, KITTI_LABEL_COLORS, KITTI_LABEL_NAMES
-except ImportError:
-    print("Warning: Could not import color definitions from scripts/visualize_osm.py")
-    MCD_LABEL_COLORS = {}
-    MCD_LABEL_NAMES = {}
+import composite_bki_cpp
+import numpy as np
+from visualize_osm import MCD_LABEL_COLORS, MCD_LABEL_NAMES, KITTI_LABEL_COLORS, KITTI_LABEL_NAMES
 
 points = np.fromfile('example_data/mcd_scan/data/0000000011.bin', dtype=np.float32).reshape(-1,4)
 labels = np.fromfile('example_data/mcd_scan/pred_labels/0000000011_prediction.label', dtype=np.uint32)

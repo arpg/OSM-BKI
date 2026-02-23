@@ -12,15 +12,9 @@ import sys
 import argparse
 import yaml
 import numpy as np
+import pandas as pd
+import composite_bki_cpp
 from pathlib import Path
-
-# Optional: use transform from build_voxel_map if available
-try:
-    import pandas as pd
-    from scipy.spatial.transform import Rotation as R
-    _HAS_TRANSFORM = True
-except ImportError:
-    _HAS_TRANSFORM = False
 
 
 def load_body_to_lidar(calib_yaml_path: str) -> np.ndarray:
@@ -36,8 +30,6 @@ def load_body_to_lidar(calib_yaml_path: str) -> np.ndarray:
 
 def load_poses(pose_file):
     """Load poses from CSV (num,t,x,y,z,qx,qy,qz,qw). Returns dict frame_num -> (7,) pose."""
-    if not _HAS_TRANSFORM:
-        raise RuntimeError("pandas and scipy are required for pose loading. pip install pandas scipy")
     df = pd.read_csv(pose_file)
     poses = {}
     for _, row in df.iterrows():
@@ -48,34 +40,14 @@ def load_poses(pose_file):
     return poses
 
 
-def transform_points_to_world(points, pose, body_to_lidar: np.ndarray,
-                              init_rel_pos: np.ndarray = None):
-    """
-    LiDAR -> Body -> World using calibration, matching visualize_map_osm.cpp:
-
-        body_to_world  = poseToMatrix(pose)
-        body_to_world[:3, 3] -= init_rel_pos   # re-zero world frame
-        lidar_to_map   = body_to_world @ inv(body_to_lidar)
-
-    points (N,3), pose (7,) [x,y,z,qx,qy,qz,qw].
-    """
-    position = pose[:3]
-    quat = pose[3:7]
-    body_rotation_matrix = R.from_quat(quat).as_matrix()
-    body_to_world = np.eye(4, dtype=np.float64)
-    body_to_world[:3, :3] = body_rotation_matrix
-    body_to_world[:3, 3] = np.asarray(position, dtype=np.float64)
-
-    if init_rel_pos is not None:
-        body_to_world[0, 3] -= init_rel_pos[0]
-        body_to_world[1, 3] -= init_rel_pos[1]
-        body_to_world[2, 3] -= init_rel_pos[2]
-
-    lidar_to_body = np.linalg.inv(body_to_lidar)
-    transform_matrix = body_to_world @ lidar_to_body
-    points_homogeneous = np.hstack([np.asarray(points, dtype=np.float64), np.ones((points.shape[0], 1))])
-    world_points = (transform_matrix @ points_homogeneous.T).T
-    return world_points[:, :3].astype(np.float32)
+def transform_points_to_world(points, pose, body_to_lidar, init_rel_pos=None):
+    """Delegate to C++ transform_scan_to_world (pose_utils.hpp)."""
+    return composite_bki_cpp.transform_scan_to_world(
+        np.ascontiguousarray(points, dtype=np.float32),
+        np.asarray(pose, dtype=np.float64),
+        np.ascontiguousarray(body_to_lidar, dtype=np.float64),
+        np.asarray(init_rel_pos, dtype=np.float64) if init_rel_pos is not None else None,
+    )
 
 
 def load_scan(bin_path):
@@ -165,20 +137,6 @@ def main():
     parser.add_argument("--osm_origin_lon", type=float, default=None,
                         help="Override OSM projection origin longitude (read from config YAML if not given)")
     args = parser.parse_args()
-
-    if args.pose and not _HAS_TRANSFORM:
-        print("ERROR: --pose requires pandas and scipy. pip install pandas scipy", file=sys.stderr)
-        return 1
-
-    try:
-        import composite_bki_cpp
-    except ImportError:
-        sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
-        try:
-            import composite_bki_cpp
-        except ImportError:
-            print("ERROR: composite_bki_cpp not found. Install the package or run from repo root with PYTHONPATH=src", file=sys.stderr)
-            return 1
 
     scan_dir = Path(args.scan_dir)
     label_dir = Path(args.label_dir)

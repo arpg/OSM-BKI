@@ -32,13 +32,13 @@ from typing import Optional
 import os
 import sys
 import xml.etree.ElementTree as ET
+import yaml
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import open3d as o3d
-from scipy.spatial.transform import Rotation as R
-
+import composite_bki_cpp
 from composite_bki_cpp import latlon_to_mercator
 
 
@@ -336,7 +336,6 @@ def load_dataset_config(config_path: str) -> dict:
 
     Mirrors loadDatasetConfig() + path construction in dataset_utils.cpp.
     """
-    import yaml
     with open(config_path) as f:
         raw = yaml.safe_load(f)
 
@@ -388,7 +387,6 @@ def load_body_to_lidar(calib_yaml_path: str) -> np.ndarray:
     Read body/os_sensor/T from hhs_calib.yaml → 4×4 float64 matrix.
     Mirrors readBodyToLidarCalibration() in file_io.cpp.
     """
-    import yaml
     with open(calib_yaml_path) as f:
         calib = yaml.safe_load(f)
     rows = calib['body']['os_sensor']['T']
@@ -453,33 +451,24 @@ def collect_scan_label_pairs(lidar_dir: str, label_dir: str) -> list:
     return pairs
 
 
-def build_lidar_to_map(pose: np.ndarray,
-                       body_to_lidar: np.ndarray,
-                       init_rel_pos: np.ndarray) -> np.ndarray:
-    """
-    Mirrors the per-pose transform in visualize_map_osm.cpp:
-
-        body_to_world_rel = poseToMatrix(pose)
-        body_to_world_rel[:3, 3] -= init_rel_pos      # re-centre world origin
-        lidar_to_map = body_to_world_rel @ inv(body_to_lidar)
-
-    pose = [x, y, z, qx, qy, qz, qw]  (C++ poseToMatrix uses Eigen::Quaterniond(qw,qx,qy,qz);
-                                         scipy from_quat takes [qx,qy,qz,qw])
-    """
-    x, y, z, qx, qy, qz, qw = pose
-    rot = R.from_quat([qx, qy, qz, qw]).as_matrix()
-
-    body_to_world = np.eye(4, dtype=np.float64)
-    body_to_world[:3, :3] = rot
-    body_to_world[0, 3]   = x - init_rel_pos[0]
-    body_to_world[1, 3]   = y - init_rel_pos[1]
-    body_to_world[2, 3]   = z - init_rel_pos[2]
-
-    return body_to_world @ np.linalg.inv(body_to_lidar)
+def transform_scan_to_world(points: np.ndarray,
+                            pose: np.ndarray,
+                            body_to_lidar: np.ndarray,
+                            init_rel_pos: np.ndarray) -> np.ndarray:
+    """Delegate to C++ pose_utils::transformScanToWorld (shared with visualize_map_osm.cpp)."""
+    irp = np.asarray(init_rel_pos, dtype=np.float64) if np.any(init_rel_pos) else None
+    return composite_bki_cpp.transform_scan_to_world(
+        np.ascontiguousarray(points, dtype=np.float32),
+        np.asarray(pose, dtype=np.float64),
+        np.ascontiguousarray(body_to_lidar, dtype=np.float64),
+        irp,
+    )
 
 
 def build_map_cloud(pairs: list,
-                    lidar_to_map_by_id: dict,
+                    poses_by_id: dict,
+                    body_to_lidar: np.ndarray,
+                    init_rel_pos: np.ndarray,
                     colors_by_label: dict,
                     step: int = 1,
                     max_scans: Optional[int] = None) -> 'o3d.geometry.PointCloud | None':
@@ -487,7 +476,7 @@ def build_map_cloud(pairs: list,
     Accumulate scans (stride=step) into a single Open3D PointCloud coloured
     by semantic label.  Mirrors the scan loop in visualize_map_osm.cpp.
 
-    Binary format: lidar .bin = float32[N×4] (x,y,z,intensity),
+    Binary format: lidar .bin = float32[N*4] (x,y,z,intensity),
                    label .bin = uint32[N].
     """
     all_pts    = []
@@ -498,13 +487,13 @@ def build_map_cloud(pairs: list,
         if max_scans is not None and loaded >= max_scans:
             break
         scan_id, scan_path, label_path = pairs[i]
-        if scan_id not in lidar_to_map_by_id:
+        if scan_id not in poses_by_id:
             skipped += 1
             continue
 
         try:
             raw = np.fromfile(scan_path, dtype=np.float32).reshape(-1, 4)
-            pts = raw[:, :3].astype(np.float64)
+            pts = raw[:, :3]
         except Exception as e:
             print(f"  Warning: could not read {scan_path}: {e}")
             skipped += 1
@@ -521,10 +510,8 @@ def build_map_cloud(pairs: list,
             skipped += 1
             continue
 
-        # Transform to map frame  (vectorised)
-        T      = lidar_to_map_by_id[scan_id]
-        pts_h  = np.hstack([pts, np.ones((len(pts), 1))])
-        world  = (T @ pts_h.T).T[:, :3]
+        world = transform_scan_to_world(
+            pts, poses_by_id[scan_id], body_to_lidar, init_rel_pos)
 
         # Colour by label (vectorised per unique label)
         colours = np.zeros((len(labels), 3), dtype=np.float32)
@@ -664,22 +651,17 @@ def main():
     print(f"init_rel_pos = [{init_rel_pos[0]:.4f}, "
           f"{init_rel_pos[1]:.4f}, {init_rel_pos[2]:.4f}]")
 
-    # ── Pre-compute lidar_to_map per pose (mirrors C++ loop before scan loop)
-    lidar_to_map_by_id = {
-        scan_id: build_lidar_to_map(pose, body_to_lidar, init_rel_pos)
-        for scan_id, pose in poses_by_id.items()
-    }
-
     # ── Collect scan/label pairs ───────────────────────────────────────────
     pairs = collect_scan_label_pairs(cfg['lidar_dir'], cfg['label_dir'])
     if not pairs:
         sys.exit("No scan/label pairs found.")
 
-    # ── Accumulate map cloud ───────────────────────────────────────────────
+    # ── Accumulate map cloud (C++ transform_scan_to_world per scan) ───────
     print(f"Accumulating map (step={step}, pairs={len(pairs)}"
           + (f", max_scans={args.max_scans})" if args.max_scans else ")") + "...")
     map_cloud = build_map_cloud(
-        pairs, lidar_to_map_by_id, cfg['colors_by_label'],
+        pairs, poses_by_id, body_to_lidar, init_rel_pos,
+        cfg['colors_by_label'],
         step=step, max_scans=args.max_scans)
     if map_cloud is None or len(map_cloud.points) == 0:
         sys.exit("No map points accumulated.")
