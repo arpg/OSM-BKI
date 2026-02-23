@@ -10,73 +10,14 @@ points are transformed and passed directly to the BKI.
 import os
 import sys
 import argparse
-import yaml
 import numpy as np
-import pandas as pd
 import composite_bki_cpp
 from pathlib import Path
 
-
-def load_body_to_lidar(calib_yaml_path: str) -> np.ndarray:
-    """Read body/os_sensor/T from hhs_calib.yaml → 4×4 float64 matrix."""
-    with open(calib_yaml_path) as f:
-        calib = yaml.safe_load(f)
-    rows = calib["body"]["os_sensor"]["T"]
-    mat = np.array(rows, dtype=np.float64)
-    if mat.shape != (4, 4):
-        raise ValueError(f"Expected 4×4 matrix in {calib_yaml_path}, got {mat.shape}")
-    return mat
-
-
-def load_poses(pose_file):
-    """Load poses from CSV (num,t,x,y,z,qx,qy,qz,qw). Returns dict frame_num -> (7,) pose."""
-    df = pd.read_csv(pose_file)
-    poses = {}
-    for _, row in df.iterrows():
-        frame_num = int(row["num"])
-        x, y, z = float(row["x"]), float(row["y"]), float(row["z"])
-        qx, qy, qz, qw = float(row["qx"]), float(row["qy"]), float(row["qz"]), float(row["qw"])
-        poses[frame_num] = np.array([x, y, z, qx, qy, qz, qw])
-    return poses
-
-
-def transform_points_to_world(points, pose, body_to_lidar, init_rel_pos=None):
-    """Delegate to C++ transform_scan_to_world (pose_utils.hpp)."""
-    return composite_bki_cpp.transform_scan_to_world(
-        np.ascontiguousarray(points, dtype=np.float32),
-        np.asarray(pose, dtype=np.float64),
-        np.ascontiguousarray(body_to_lidar, dtype=np.float64),
-        np.asarray(init_rel_pos, dtype=np.float64) if init_rel_pos is not None else None,
-    )
-
-
-def load_scan(bin_path):
-    """Load point cloud (N,4) and return (N,3) xyz, (N,) intensity."""
-    scan = np.fromfile(bin_path, dtype=np.float32).reshape(-1, 4)
-    return scan[:, :3], scan[:, 3]
-
-
-def load_labels(label_path):
-    """Load semantic labels; lower 16 bits (same as build_voxel_map)."""
-    raw = np.fromfile(label_path, dtype=np.uint32)
-    return (raw & 0xFFFF).astype(np.uint32)
-
-
-def find_label_file(label_dir, scan_stem):
-    """Find label file for a scan; try .label, .bin, _prediction.label, _prediction.bin."""
-    exts = [".label", ".bin", "_prediction.label", "_prediction.bin"]
-    for ext in exts:
-        p = Path(label_dir) / f"{scan_stem}{ext}"
-        if p.exists():
-            return str(p)
-    return None
-
-
-def get_frame_number(stem):
-    try:
-        return int(stem)
-    except ValueError:
-        return None
+from script_utils import (
+    load_body_to_lidar, load_poses_csv, transform_points_to_world,
+    load_scan, load_labels, find_label_file, get_frame_number, ConfigReader
+)
 
 
 def compute_metrics(pred, gt, ignore_label=0):
@@ -127,8 +68,6 @@ def main():
     parser.add_argument("--seed-osm-prior", type=bool, default=False, help="Enable OSM prior seeding")
     parser.add_argument("--osm-prior-strength", type=float, default=0.0, help="OSM prior strength")
     parser.add_argument("--disable-osm-fallback", type=bool, default=False, help="Disable OSM fallback during inference")
-    parser.add_argument("--lambda-min", type=float, default=0.8, help="Min forgetting factor (for high confidence OSM areas)")
-    parser.add_argument("--lambda-max", type=float, default=0.99, help="Max forgetting factor (for low confidence OSM areas)")
     parser.add_argument("--init_rel_pos", type=float, nargs=3, metavar=('X', 'Y', 'Z'), default=None,
                         help="World-frame initial position to subtract from poses "
                              "(overrides init_rel_pos_day_06 in config YAML)")
@@ -205,11 +144,9 @@ def main():
     if args.init_rel_pos is not None:
         init_rel_pos = np.array(args.init_rel_pos, dtype=np.float64)
     else:
-        with open(args.config) as _cf:
-            _cfg = yaml.safe_load(_cf)
-        if 'init_rel_pos_day_06' in _cfg:
-            rp = _cfg['init_rel_pos_day_06']
-            init_rel_pos = np.array([float(rp[0]), float(rp[1]), float(rp[2])], dtype=np.float64)
+        init_rel_pos = ConfigReader(args.config).init_rel_pos
+        if init_rel_pos is not None:
+            init_rel_pos = init_rel_pos.astype(np.float64)
 
     if init_rel_pos is not None:
         print(f"init_rel_pos = [{init_rel_pos[0]:.4f}, {init_rel_pos[1]:.4f}, {init_rel_pos[2]:.4f}]")
@@ -225,7 +162,7 @@ def main():
         if not os.path.exists(args.calib):
             print(f"Calibration file not found: {args.calib}", file=sys.stderr)
             return 1
-        poses = load_poses(args.pose)
+        poses = load_poses_csv(args.pose)
         body_to_lidar = load_body_to_lidar(args.calib)
         print(f"Loaded {len(poses)} poses; transforming scans to world frame using {args.calib}")
     else:
@@ -255,9 +192,7 @@ def main():
             alpha0=args.alpha0,
             seed_osm_prior=args.seed_osm_prior,
             osm_prior_strength=args.osm_prior_strength,
-            osm_fallback_in_infer=not args.disable_osm_fallback,
-            lambda_min=args.lambda_min,
-            lambda_max=args.lambda_max
+            osm_fallback_in_infer=not args.disable_osm_fallback
         )
         for scan_path in train_files:
             stem = scan_path.stem
@@ -303,9 +238,7 @@ def main():
             alpha0=args.alpha0,
             seed_osm_prior=args.seed_osm_prior,
             osm_prior_strength=args.osm_prior_strength,
-            osm_fallback_in_infer=not args.disable_osm_fallback,
-            lambda_min=args.lambda_min,
-            lambda_max=args.lambda_max
+            osm_fallback_in_infer=not args.disable_osm_fallback
         )
         for scan_path in train_files:
             stem = scan_path.stem

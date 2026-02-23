@@ -30,172 +30,23 @@ import argparse
 from typing import Optional
 import os
 import sys
-import yaml
 from pathlib import Path
 
 import numpy as np
 import open3d as o3d
-import composite_bki_cpp
 
-from osm_loader import OSMLoader, create_thick_lines
-
-# Semantic label colours (from mcd_config.yaml `colors:` block, normalised to [0,1])
-MCD_LABEL_COLORS = {
-    0:  [128/255, 128/255, 128/255],  # barrier
-    1:  [119/255,  11/255,  32/255],  # bike
-    2:  [  0/255, 100/255,   0/255],  # building
-    3:  [139/255,  69/255,  19/255],  # chair
-    4:  [101/255,  67/255,  33/255],  # cliff
-    5:  [160/255, 160/255, 160/255],  # container
-    6:  [244/255,  35/255, 232/255],  # curb
-    7:  [190/255, 153/255, 153/255],  # fence
-    8:  [255/255, 165/255,   0/255],  # hydrant
-    9:  [255/255, 255/255,   0/255],  # infosign
-    10: [170/255, 255/255, 150/255],  # lanemarking
-    11: [  0/255,   0/255,   0/255],  # noise
-    12: [255/255, 255/255,  50/255],  # other
-    13: [250/255, 170/255, 160/255],  # parkinglot
-    14: [220/255,  20/255,  60/255],  # pedestrian
-    15: [153/255, 153/255, 153/255],  # pole
-    16: [128/255,  64/255, 128/255],  # road
-    17: [  0/255, 100/255,   0/255],  # shelter
-    18: [244/255,  35/255, 232/255],  # sidewalk
-    19: [128/255,   0/255, 128/255],  # stairs
-    20: [  0/255, 150/255, 255/255],  # structure-other
-    21: [255/255,  69/255,   0/255],  # traffic-cone
-    22: [  0/255,   0/255, 255/255],  # traffic-sign
-    23: [139/255,   0/255, 139/255],  # trashbin
-    24: [  0/255,  60/255, 135/255],  # treetrunk
-    25: [107/255, 142/255,  35/255],  # vegetation
-    26: [245/255, 150/255, 100/255],  # vehicle-dynamic
-    27: [ 51/255,   0/255,  51/255],  # vehicle-other
-    28: [  0/255,   0/255, 142/255],  # vehicle-static
-}
-
-# Vectorised look-up table: index = label id, value = [r, g, b] float32
-_MAX_LABEL = max(MCD_LABEL_COLORS) + 1
-_COLOR_LUT  = np.zeros((_MAX_LABEL, 3), dtype=np.float32)
-for _lbl, _rgb in MCD_LABEL_COLORS.items():
-    _COLOR_LUT[_lbl] = _rgb
-
-
-def _color_from_label(label: int) -> list:
-    """Return [r, g, b] in [0, 1]; MCD lookup first, then hash fallback
-    matching colorFromLabel() in visualize_map_osm.cpp."""
-    if 0 <= label < _MAX_LABEL:
-        return _COLOR_LUT[label].tolist()
-    h = (label * 2654435761) & 0xFFFFFFFF
-    return [((h >> 16) & 0xFF) / 255.0,
-            ((h >>  8) & 0xFF) / 255.0,
-            ( h        & 0xFF) / 255.0]
+from script_utils import (
+    ConfigReader, OSMLoader, create_thick_lines,
+    load_body_to_lidar, load_poses_csv, transform_points_to_world,
+    map_labels_to_colors,
+)
 
 
 # ─── Dataset / calibration loading ───────────────────────────────────────────
 
-def load_dataset_config(config_path: str) -> dict:
-    """
-    Read mcd_config.yaml and return a dict mirroring DatasetConfig in
-    dataset_utils.hpp, with all paths fully resolved.
-
-    Mirrors loadDatasetConfig() + path construction in dataset_utils.cpp.
-    """
-    with open(config_path) as f:
-        raw = yaml.safe_load(f)
-
-    root = raw['dataset_root_path']
-    seq  = raw['sequence']
-    base = os.path.join(root, seq)
-
-    cfg: dict = {
-        'skip_frames':       int(raw.get('skip_frames', 0)),
-        'lidar_dir':         os.path.join(base, 'lidar_bin', 'data'),
-        'label_dir':         os.path.join(base, 'gt_labels'),
-        'pose_path':         os.path.join(base, 'pose_inW.csv'),
-        'calibration_path':  os.path.join(root, 'hhs_calib.yaml'),
-        'osm_file':          '',
-        'use_osm_origin':    False,
-        'osm_origin_lat':    0.0,
-        'osm_origin_lon':    0.0,
-        'use_init_rel_pos':  False,
-        'init_rel_pos':      np.zeros(3),
-        'colors_by_label':   {},
-    }
-
-    if 'osm_file' in raw:
-        cfg['osm_file'] = os.path.join(root, raw['osm_file'])
-
-    # init_latlon_day_06 → OSM projection origin (matches use_osm_origin_from_mcd)
-    if 'init_latlon_day_06' in raw:
-        ll = raw['init_latlon_day_06']
-        cfg['osm_origin_lat'] = float(ll[0])
-        cfg['osm_origin_lon'] = float(ll[1])
-        cfg['use_osm_origin'] = True
-
-    # init_rel_pos_day_06 → pose re-centring (matches use_init_rel_pos)
-    if 'init_rel_pos_day_06' in raw:
-        rp = raw['init_rel_pos_day_06']
-        cfg['init_rel_pos']     = np.array([float(rp[0]), float(rp[1]), float(rp[2])])
-        cfg['use_init_rel_pos'] = True
-
-    # Semantic label colours from config `colors:` block
-    if 'colors' in raw:
-        for lbl_str, rgb in raw['colors'].items():
-            cfg['colors_by_label'][int(lbl_str)] = [c / 255.0 for c in rgb]
-
-    return cfg
 
 
-def load_body_to_lidar(calib_yaml_path: str) -> np.ndarray:
-    """
-    Read body/os_sensor/T from hhs_calib.yaml → 4×4 float64 matrix.
-    Mirrors readBodyToLidarCalibration() in file_io.cpp.
-    """
-    with open(calib_yaml_path) as f:
-        calib = yaml.safe_load(f)
-    rows = calib['body']['os_sensor']['T']
-    mat  = np.array(rows, dtype=np.float64)
-    if mat.shape != (4, 4):
-        raise ValueError(
-            f"Expected 4×4 matrix in {calib_yaml_path}, got {mat.shape}")
-    print(f"Loaded body→LiDAR calibration from {calib_yaml_path}")
-    return mat
-
-
-def load_poses_csv(pose_csv_path: str) -> dict:
-    """
-    Read pose CSV (num, t, x, y, z, qx, qy, qz[, qw]) and return
-    {scan_id: np.array([x, y, z, qx, qy, qz, qw])}.
-
-    Mirrors readPosesCSV() / parsePoseLine() in file_io.cpp:
-      col 0 → scan_id   col 2-4 → x, y, z
-      col 5-7 → qx, qy, qz   col 8 → qw (default 1.0 if absent)
-    Non-numeric tokens (CSV header) are silently skipped.
-    """
-    poses: dict = {}
-    with open(pose_csv_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            sep  = ',' if ',' in line else None
-            vals = []
-            for tok in (line.split(sep) if sep else line.split()):
-                try:
-                    vals.append(float(tok))
-                except ValueError:
-                    pass
-            if len(vals) < 8:
-                continue
-            scan_id       = int(vals[0])
-            qw            = vals[8] if len(vals) > 8 else 1.0
-            poses[scan_id] = np.array(
-                [vals[2], vals[3], vals[4], vals[5], vals[6], vals[7], qw],
-                dtype=np.float64)
-    print(f"Loaded {len(poses)} poses from {pose_csv_path}")
-    return poses
-
-
-def collect_scan_label_pairs(lidar_dir: str, label_dir: str) -> list:
+def _collect_scan_label_pairs(lidar_dir: str, label_dir: str) -> list:
     """
     Return a sorted list of (scan_id, scan_path, label_path) for all .bin
     files in lidar_dir that have a matching .bin in label_dir.
@@ -214,18 +65,6 @@ def collect_scan_label_pairs(lidar_dir: str, label_dir: str) -> list:
     return pairs
 
 
-def transform_scan_to_world(points: np.ndarray,
-                            pose: np.ndarray,
-                            body_to_lidar: np.ndarray,
-                            init_rel_pos: np.ndarray) -> np.ndarray:
-    """Delegate to C++ pose_utils::transformScanToWorld (shared with visualize_map_osm.cpp)."""
-    irp = np.asarray(init_rel_pos, dtype=np.float64) if np.any(init_rel_pos) else None
-    return composite_bki_cpp.transform_scan_to_world(
-        np.ascontiguousarray(points, dtype=np.float32),
-        np.asarray(pose, dtype=np.float64),
-        np.ascontiguousarray(body_to_lidar, dtype=np.float64),
-        irp,
-    )
 
 
 def build_map_cloud(pairs: list,
@@ -273,17 +112,10 @@ def build_map_cloud(pairs: list,
             skipped += 1
             continue
 
-        world = transform_scan_to_world(
+        world = transform_points_to_world(
             pts, poses_by_id[scan_id], body_to_lidar, init_rel_pos)
 
-        # Colour by label (vectorised per unique label)
-        colours = np.zeros((len(labels), 3), dtype=np.float32)
-        for lbl in np.unique(labels):
-            mask = labels == lbl
-            if int(lbl) in colors_by_label:
-                colours[mask] = colors_by_label[int(lbl)]
-            else:
-                colours[mask] = _color_from_label(int(lbl))
+        colours = map_labels_to_colors(labels, colors_by_label)
 
         all_pts.append(world)
         all_colors.append(colours)
@@ -369,11 +201,12 @@ def main():
         'osm_origin_lon':   0.0,
         'use_init_rel_pos': False,
         'init_rel_pos':     np.zeros(3),
-        'colors_by_label':  {},
     }
 
+    config_reader = None
     if args.config:
-        cfg.update(load_dataset_config(args.config))
+        config_reader = ConfigReader(args.config)
+        cfg.update(config_reader.get_dataset_config())
         print(f"Loaded config from {args.config}")
 
     # CLI args always override config file values
@@ -415,16 +248,17 @@ def main():
           f"{init_rel_pos[1]:.4f}, {init_rel_pos[2]:.4f}]")
 
     # ── Collect scan/label pairs ───────────────────────────────────────────
-    pairs = collect_scan_label_pairs(cfg['lidar_dir'], cfg['label_dir'])
+    pairs = _collect_scan_label_pairs(cfg['lidar_dir'], cfg['label_dir'])
     if not pairs:
         sys.exit("No scan/label pairs found.")
 
     # ── Accumulate map cloud (C++ transform_scan_to_world per scan) ───────
     print(f"Accumulating map (step={step}, pairs={len(pairs)}"
           + (f", max_scans={args.max_scans})" if args.max_scans else ")") + "...")
+    colors_by_label = config_reader.colors_by_label if config_reader else {}
     map_cloud = build_map_cloud(
         pairs, poses_by_id, body_to_lidar, init_rel_pos,
-        cfg['colors_by_label'],
+        colors_by_label,
         step=step, max_scans=args.max_scans)
     if map_cloud is None or len(map_cloud.points) == 0:
         sys.exit("No map points accumulated.")

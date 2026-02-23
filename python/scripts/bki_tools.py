@@ -7,204 +7,120 @@ Subcommands:
   visualize - Display .bki voxels in an Open3D viewer, colored by semantic label
 
 The .bki format (version 2/3) stores a sparse block grid. Both commands read it
-via the same read_bki() logic, filtering voxels by min alpha sum.
+via BKIReader.read(), filtering voxels by min alpha sum.
 """
 
 import argparse
 import struct
 import sys
-import yaml
 import numpy as np
 import open3d as o3d
 from pathlib import Path
 
-from osm_loader import OSMLoader
-
-BLOCK_SIZE = 8
-
-# Fallback label colors when config has no colors block
-MCD_LABEL_COLORS = {
-    0: [0.5, 0.5, 0.5],    # barrier
-    1: [0.0, 0.0, 1.0],    # bike
-    2: [0.8, 0.2, 0.2],    # building
-    7: [0.6, 0.3, 0.1],    # fence
-    13: [0.4, 0.4, 0.4],   # parkinglot
-    14: [1.0, 0.5, 0.0],   # pedestrian
-    15: [0.7, 0.7, 0.0],   # pole
-    16: [0.2, 0.2, 0.2],   # road
-    18: [0.7, 0.7, 0.7],   # sidewalk
-    22: [0.0, 0.8, 0.8],   # traffic-sign
-    24: [0.4, 0.3, 0.1],   # treetrunk
-    25: [0.2, 0.8, 0.2],   # vegetation
-    26: [0.0, 0.5, 1.0],   # vehicle-dynamic
-}
-
-KITTI_LABEL_COLORS = {
-    0: [0.0, 0.0, 0.0],    # unlabeled
-    10: [0.0, 0.0, 1.0],   # car
-    30: [1.0, 0.5, 0.0],   # person
-    40: [0.2, 0.2, 0.2],   # road
-    44: [0.4, 0.4, 0.4],   # parking
-    48: [0.7, 0.7, 0.7],   # sidewalk
-    50: [0.8, 0.2, 0.2],   # building
-    51: [0.6, 0.3, 0.1],   # fence
-    70: [0.2, 0.8, 0.2],   # vegetation
-    71: [0.4, 0.3, 0.1],   # trunk
-    80: [0.7, 0.7, 0.0],   # pole
-    81: [0.0, 0.8, 0.8],   # traffic-sign
-}
+from script_utils import ConfigReader, OSMLoader, map_labels_to_colors
 
 
-def load_visualize_config(config_path):
-    """
-    Load config for visualization: colors (normalized to [0,1]) and OSM params.
-    Returns dict with: colors_by_label, osm_path, osm_origin_lat, osm_origin_lon,
-    osm_world_offset_x, osm_world_offset_y. OSM fields are None if not configured.
-    """
-    config_dir = Path(config_path).resolve().parent
-    with open(config_path) as f:
-        raw = yaml.safe_load(f) or {}
+class BKIReader:
+    """Read .bki map files and export voxels as point clouds with labels."""
 
-    out = {
-        'colors_by_label': {},
-        'osm_path': None,
-        'osm_origin_lat': None,
-        'osm_origin_lon': None,
-        'osm_world_offset_x': 0.0,
-        'osm_world_offset_y': 0.0,
-    }
+    BLOCK_SIZE = 8
 
-    if 'colors' in raw:
-        for lbl_str, rgb in raw['colors'].items():
-            out['colors_by_label'][int(lbl_str)] = [c / 255.0 for c in rgb]
+    @staticmethod
+    def _load_label_mapping(config):
+        """Load dense index -> raw label ID mapping. config: path (str) or ConfigReader."""
+        if isinstance(config, ConfigReader):
+            return config.get_label_mapping()
+        return ConfigReader(config).get_label_mapping()
 
-    # OSM origin (used when --osm override is passed or when osm_file is in config)
-    if raw.get('osm_origin_lat') is not None and raw.get('osm_origin_lon') is not None:
-        out['osm_origin_lat'] = float(raw['osm_origin_lat'])
-        out['osm_origin_lon'] = float(raw['osm_origin_lon'])
-    elif 'init_latlon_day_06' in raw:
-        ll = raw['init_latlon_day_06']
-        out['osm_origin_lat'] = float(ll[0])
-        out['osm_origin_lon'] = float(ll[1])
-    out['osm_world_offset_x'] = float(raw.get('osm_world_offset_x', 0.0))
-    out['osm_world_offset_y'] = float(raw.get('osm_world_offset_y', 0.0))
-
-    if 'osm_file' in raw:
-        root = raw.get('dataset_root_path')
-        osm_file = raw['osm_file']
-        if root:
-            out['osm_path'] = str(Path(root) / osm_file)
-        else:
-            out['osm_path'] = str(config_dir / osm_file)
-        if not Path(out['osm_path']).exists():
-            out['osm_path'] = None
-
-    return out
-
-
-def read_bki(bki_path, config_path, min_alpha_sum=1e-6, min_max_prob=0.0):
-    """
-    Read .bki file and return (points_xyz, labels_raw) as arrays.
-    points_xyz: (N, 3) float32, labels_raw: (N,) uint32.
-    Filters: sum(alpha) >= min_alpha_sum, and max(alpha)/sum(alpha) >= min_max_prob.
-    """
-    with open(config_path) as f:
-        data = yaml.safe_load(f)
-    labels = data.get("labels") or {}
-    raw_ids = sorted(int(k) for k in labels.keys())
-    K = len(raw_ids)
-    dense_to_raw = raw_ids
-
-    block_alpha_size = BLOCK_SIZE * BLOCK_SIZE * BLOCK_SIZE * K
-
-    points_list = []
-    labels_list = []
-
-    with open(bki_path, "rb") as f:
+    @staticmethod
+    def _read_header(f):
+        """Read .bki file header. Returns (version, resolution, num_blocks)."""
         version = struct.unpack("B", f.read(1))[0]
         if version not in (2, 3):
             raise ValueError(f"Unsupported .bki version {version} (expected 2 or 3)")
-
         resolution = struct.unpack("f", f.read(4))[0]
-        l_scale = struct.unpack("f", f.read(4))[0]
-        sigma_0 = struct.unpack("f", f.read(4))[0]
-
-        current_time = 0
+        struct.unpack("f", f.read(4))  # l_scale
+        struct.unpack("f", f.read(4))  # sigma_0
         if version >= 3:
-            current_time = struct.unpack("i", f.read(4))[0]
-
+            struct.unpack("i", f.read(4))  # current_time
         num_blocks = struct.unpack("Q", f.read(8))[0]
+        return version, resolution, num_blocks
 
-        for _ in range(num_blocks):
-            bx, by, bz = struct.unpack("iii", f.read(12))
+    @staticmethod
+    def _passes_filter(alpha, min_alpha_sum, min_max_prob):
+        """Return (passes: bool, best_raw_label: int) for a voxel's alpha vector."""
+        s = float(np.sum(alpha))
+        if s < min_alpha_sum:
+            return False, 0
+        if np.max(alpha) - np.min(alpha) < 1e-6:
+            return False, 0
+        max_prob = np.max(alpha) / s if s > 0 else 0.0
+        if max_prob < min_max_prob:
+            return False, 0
+        best = int(np.argmax(alpha))
+        return True, best
 
-            last_updated = 0
-            if version >= 3:
-                last_updated = struct.unpack("i", f.read(4))[0]
+    @staticmethod
+    def _voxel_to_world(bx, by, bz, lx, ly, lz, resolution):
+        """Convert block + local voxel indices to world (x, y, z)."""
+        vx = bx * BKIReader.BLOCK_SIZE + lx
+        vy = by * BKIReader.BLOCK_SIZE + ly
+        vz = bz * BKIReader.BLOCK_SIZE + lz
+        return (
+            (vx + 0.5) * resolution,
+            (vy + 0.5) * resolution,
+            (vz + 0.5) * resolution,
+        )
 
-            alpha_bytes = f.read(block_alpha_size * 4)
-            if len(alpha_bytes) != block_alpha_size * 4:
-                break
+    @classmethod
+    def read(cls, bki_path, config, min_alpha_sum=1e-6, min_max_prob=0.0):
+        """
+        Read .bki file and return (points_xyz, labels_raw).
+        points_xyz: (N, 3) float32, labels_raw: (N,) uint32.
+        """
+        dense_to_raw, K = cls._load_label_mapping(config)
+        block_alpha_size = cls.BLOCK_SIZE ** 3 * K
 
-            alpha = np.frombuffer(alpha_bytes, dtype=np.float32)
-            alpha = alpha.reshape((BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, K))
+        points_list = []
+        labels_list = []
 
-            for lz in range(BLOCK_SIZE):
-                for ly in range(BLOCK_SIZE):
-                    for lx in range(BLOCK_SIZE):
-                        a = alpha[lx, ly, lz, :]
-                        s = float(np.sum(a))
-                        if s < min_alpha_sum:
-                            continue
+        with open(bki_path, "rb") as f:
+            version, resolution, num_blocks = cls._read_header(f)
 
-                        if np.max(a) - np.min(a) < 1e-6:
-                            continue
+            for _ in range(num_blocks):
+                bx, by, bz = struct.unpack("iii", f.read(12))
+                if version >= 3:
+                    struct.unpack("i", f.read(4))  # last_updated
 
-                        max_prob = np.max(a) / s if s > 0 else 0.0
-                        if max_prob < min_max_prob:
-                            continue
+                alpha_bytes = f.read(block_alpha_size * 4)
+                if len(alpha_bytes) != block_alpha_size * 4:
+                    break
 
-                        best = int(np.argmax(a))
-                        raw = dense_to_raw[best] if best < len(dense_to_raw) else 0
+                alpha = np.frombuffer(alpha_bytes, dtype=np.float32)
+                alpha = alpha.reshape((cls.BLOCK_SIZE, cls.BLOCK_SIZE, cls.BLOCK_SIZE, K))
 
-                        vx = bx * BLOCK_SIZE + lx
-                        vy = by * BLOCK_SIZE + ly
-                        vz = bz * BLOCK_SIZE + lz
-                        x = (vx + 0.5) * resolution
-                        y = (vy + 0.5) * resolution
-                        z = (vz + 0.5) * resolution
+                for lz in range(cls.BLOCK_SIZE):
+                    for ly in range(cls.BLOCK_SIZE):
+                        for lx in range(cls.BLOCK_SIZE):
+                            a = alpha[lx, ly, lz, :]
+                            passes, best = cls._passes_filter(a, min_alpha_sum, min_max_prob)
+                            if not passes:
+                                continue
+                            raw = dense_to_raw[best] if best < len(dense_to_raw) else 0
+                            x, y, z = cls._voxel_to_world(bx, by, bz, lx, ly, lz, resolution)
+                            points_list.append([x, y, z])
+                            labels_list.append(raw)
 
-                        points_list.append([x, y, z])
-                        labels_list.append(raw)
+        if not points_list:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.uint32)
 
-    if not points_list:
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.uint32)
-
-    points_xyz = np.array(points_list, dtype=np.float32)
-    labels_raw = np.array(labels_list, dtype=np.uint32)
-    return points_xyz, labels_raw
+        return (
+            np.array(points_list, dtype=np.float32),
+            np.array(labels_list, dtype=np.uint32),
+        )
 
 
-def get_label_colors(labels, label_format="auto", colors_from_config=None):
-    """(N,) uint32 labels -> (N, 3) RGB. Uses config colors when provided."""
-    colors = np.zeros((len(labels), 3))
-    if colors_from_config:
-        color_map = colors_from_config
-    elif label_format == "auto":
-        unique = np.unique(labels)
-        if np.max(unique) > 30 or any(l in (40, 44, 48, 50, 70, 80, 81) for l in unique):
-            color_map = KITTI_LABEL_COLORS
-        else:
-            color_map = MCD_LABEL_COLORS
-    else:
-        color_map = KITTI_LABEL_COLORS if label_format == "kitti" else MCD_LABEL_COLORS
-    for i, label in enumerate(labels):
-        label = int(label)
-        if label in color_map:
-            colors[i] = color_map[label]
-        else:
-            colors[i] = [1.0, 0.0, 1.0]
-    return colors
+
 
 
 def cmd_convert(args):
@@ -219,8 +135,9 @@ def cmd_convert(args):
     out_bin = args.output_bin or str(bki_path.parent / f"{stem}_map.bin")
     out_label = args.output_label or str(bki_path.parent / f"{stem}_map.label")
 
+    cfg = ConfigReader(args.config)
     print(f"Reading {bki_path} with config {args.config}...")
-    points_xyz, labels_raw = read_bki(str(bki_path), args.config, min_alpha_sum=args.min_alpha, min_max_prob=args.min_max_prob)
+    points_xyz, labels_raw = BKIReader.read(str(bki_path), cfg, min_alpha_sum=args.min_alpha, min_max_prob=args.min_max_prob)
     n = len(points_xyz)
     print(f"Exporting {n} voxels.")
 
@@ -240,17 +157,18 @@ def cmd_visualize(args):
     if not Path(args.config).exists():
         raise SystemExit(f"Config not found: {args.config}")
 
-    viz_cfg = load_visualize_config(args.config)
-    colors_from_config = viz_cfg['colors_by_label'] if viz_cfg['colors_by_label'] else None
+    cfg = ConfigReader(args.config)
+    viz_cfg = cfg.get_visualize_config()
+    colors_by_label = cfg.colors_by_label
     osm_path = None if args.no_osm else (args.osm or viz_cfg['osm_path'])
 
     print(f"Loading {bki_path}...")
-    points_xyz, labels_raw = read_bki(str(bki_path), args.config, min_alpha_sum=args.min_alpha, min_max_prob=args.min_max_prob)
+    points_xyz, labels_raw = BKIReader.read(str(bki_path), cfg, min_alpha_sum=args.min_alpha, min_max_prob=args.min_max_prob)
     n = len(points_xyz)
     if n == 0:
         raise SystemExit("No voxels to show (try lowering --min-alpha or --min-max-prob).")
 
-    colors = get_label_colors(labels_raw, args.format, colors_from_config=colors_from_config)
+    colors = map_labels_to_colors(labels_raw, colors_by_label)
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_xyz.astype(np.float64))
     pcd.colors = o3d.utility.Vector3dVector(colors)
@@ -310,7 +228,6 @@ Examples:
     p_vis.add_argument("--config", required=True, help="Path to YAML config used when building the map")
     p_vis.add_argument("--min-alpha", type=float, default=1e-6, help="Min alpha sum per voxel (default: 1e-6)")
     p_vis.add_argument("--min-max-prob", type=float, default=0.0, help="Min predicted class probability max(alpha)/sum(alpha) (default: 0.0)")
-    p_vis.add_argument("--format", choices=["auto", "mcd", "kitti"], default="auto", help="Label format for colors (ignored when config has colors)")
     p_vis.add_argument("--point-size", type=float, default=2.0, help="Point size (default: 2.0)")
     p_vis.add_argument("--osm-z-offset", type=float, default=0.05, help="Z height for OSM lines (default: 0.05)")
     p_vis.add_argument("--osm-thick", action="store_true", help="Render OSM as thick cylinder meshes")
