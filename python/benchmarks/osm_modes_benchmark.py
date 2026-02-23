@@ -18,9 +18,9 @@ from pathlib import Path
 from datetime import datetime
 import time
 
-# Add parent directory to path to import composite_bki_cpp
+# Add parent directory to path to import osm_bki_cpp
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-import composite_bki_cpp
+import osm_bki_cpp
 
 # Import benchmark utilities
 from benchmark_utils import (
@@ -67,7 +67,7 @@ def run_config(config_name, seed, strength, fallback, scan_files, label_dir, gt_
     """Run a single configuration."""
     print(f"\nRunning Config: {config_name} (seed={seed}, str={strength}, fallback={fallback})...")
     
-    bki = composite_bki_cpp.PyContinuousBKI(
+    bki = osm_bki_cpp.PyContinuousBKI(
         osm_path=str(osm_path),
         config_path=str(config_path),
         resolution=args.resolution,
@@ -81,9 +81,7 @@ def run_config(config_name, seed, strength, fallback, scan_files, label_dir, gt_
         alpha0=args.alpha0,
         seed_osm_prior=seed,
         osm_prior_strength=strength,
-        osm_fallback_in_infer=fallback,
-        lambda_min=args.lambda_min,
-        lambda_max=args.lambda_max
+        osm_fallback_in_infer=fallback
     )
     
     results = []
@@ -147,8 +145,6 @@ def main():
     parser.add_argument("--prior-delta", type=float, default=0.5)
     parser.add_argument("--height-sigma", type=float, default=0.3)
     parser.add_argument("--alpha0", type=float, default=1.0)
-    parser.add_argument("--lambda-min", type=float, default=0.0)
-    parser.add_argument("--lambda-max", type=float, default=0.0)
     
     # Benchmark Options
     parser.add_argument("--checkpoints", type=int, nargs="+", default=[10, 20, 30, 40, 50, 60, 70, 80, 90], help="Scan counts to evaluate at")

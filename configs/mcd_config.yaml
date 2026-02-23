@@ -1,20 +1,21 @@
 # MCD Dataset Configuration
 # Configuration for Multi-Class Dataset (MCD) semantic segmentation
+#
+# Paths: use direct keys (relative to this config file) or legacy dataset_root_path+sequence.
+# Direct paths take precedence when present.
 
 dataset_name: "mcd"
-dataset_root_path: "/media/donceykong/doncey_ssd_02/datasets/MCD"
-# Required by C++ loadDatasetConfig (paths under dataset_root_path/sequence/...)
-sequence: "kth_day_06"
-lidar_data_path: "kth_day_06/lidar_bin/data/"
-pred_labels_path: "kth_day_06/inferred_labels/cenet_semkitti/"
-gt_labels_path: "kth_day_06/gt_labels/"
-pose_file: "kth_day_06/pose_inW.csv"
-osm_file: "kth.osm"
-# Optional: scan ID for basic_usage.py (e.g. "0000000011"); if missing, first .bin in lidar_data_path is used
-# example_scan_id: "0000000011"
+# Legacy (optional): dataset_root_path + sequence derive lidar_dir, label_dir, etc.
+# dataset_root_path: "/path/to/example_data/mcd"
+# sequence: "kth_day_06"
+# Direct paths (relative to configs/ directory):
+lidar_dir: "../example_data/mcd/kth_day_06/lidar_bin/data"
+label_dir: "../example_data/mcd/kth_day_06/gt_labels"
+pose_path: "../example_data/mcd/kth_day_06/pose_inW.csv"
+calibration_path: "../example_data/mcd/hhs_calib.yaml"
+osm_file: "../example_data/mcd/kth.osm"
 
-skip_frames: 500
-
+skip_frames: 10
 init_latlon_day_06: [59.348268650, 18.073204280]
 init_rel_pos_day_06: [64.3932532565158, 66.4832330946657, 38.5143341050069]
 

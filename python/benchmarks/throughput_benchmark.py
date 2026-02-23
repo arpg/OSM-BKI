@@ -28,9 +28,9 @@ except ImportError:
     _HAS_PSUTIL = False
     print("⚠️  psutil not found. Memory measurements will be skipped. (pip install psutil)")
 
-# Add parent directory to path to import composite_bki_cpp
+# Add parent directory to path to import osm_bki_cpp
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-import composite_bki_cpp
+import osm_bki_cpp
 
 # Import benchmark utilities
 from benchmark_utils import (
@@ -59,9 +59,10 @@ def subsample_points(points, labels, target_count):
     indices = np.random.choice(len(points), target_count, replace=False)
     return points[indices], labels[indices]
 
-def run_thread_scaling(scan_path, label_path, osm_path, config_path, args):
+def run_thread_scaling(scan_path, label_path, osm_path, config_path, args, scan_name=None):
     """Benchmark performance vs number of threads."""
-    print("\n--- Thread Scaling Benchmark ---")
+    scan_name = scan_name or scan_path.stem
+    print(f"\n--- Thread Scaling Benchmark ({scan_name}) ---")
     
     points_raw, _ = load_scan(str(scan_path))
     labels_raw = load_labels(label_path)
@@ -77,7 +78,7 @@ def run_thread_scaling(scan_path, label_path, osm_path, config_path, args):
         print(f"Testing with {n_threads} threads...", end=" ", flush=True)
         
         # Initialize (exclude from timing)
-        bki = composite_bki_cpp.PyContinuousBKI(
+        bki = osm_bki_cpp.PyContinuousBKI(
             osm_path=str(osm_path),
             config_path=str(config_path),
             resolution=args.resolution,
@@ -91,9 +92,7 @@ def run_thread_scaling(scan_path, label_path, osm_path, config_path, args):
             alpha0=args.alpha0,
             seed_osm_prior=args.seed_osm_prior,
             osm_prior_strength=args.osm_prior_strength,
-            osm_fallback_in_infer=not args.disable_osm_fallback,
-            lambda_min=args.lambda_min,
-            lambda_max=args.lambda_max
+            osm_fallback_in_infer=not args.disable_osm_fallback
         )
         
         # Warmup (optional, but good for JIT/cache)
@@ -109,6 +108,7 @@ def run_thread_scaling(scan_path, label_path, osm_path, config_path, args):
         
         results.append({
             "experiment": "thread_scaling",
+            "scan": scan_name,
             "threads": n_threads,
             "points": len(points),
             "resolution": args.resolution,
@@ -121,9 +121,10 @@ def run_thread_scaling(scan_path, label_path, osm_path, config_path, args):
         
     return results
 
-def run_point_scaling(scan_path, label_path, osm_path, config_path, args):
+def run_point_scaling(scan_path, label_path, osm_path, config_path, args, scan_name=None):
     """Benchmark performance vs point cloud size."""
-    print("\n--- Point Density Scaling Benchmark ---")
+    scan_name = scan_name or scan_path.stem
+    print(f"\n--- Point Density Scaling Benchmark ({scan_name}) ---")
     
     points_full, _ = load_scan(str(scan_path))
     labels_full = load_labels(label_path)
@@ -139,7 +140,7 @@ def run_point_scaling(scan_path, label_path, osm_path, config_path, args):
         points, labels = subsample_points(points_full, labels_full, size)
         
         # Initialize
-        bki = composite_bki_cpp.PyContinuousBKI(
+        bki = osm_bki_cpp.PyContinuousBKI(
             osm_path=str(osm_path),
             config_path=str(config_path),
             resolution=args.resolution,
@@ -153,9 +154,7 @@ def run_point_scaling(scan_path, label_path, osm_path, config_path, args):
             alpha0=args.alpha0,
             seed_osm_prior=args.seed_osm_prior,
             osm_prior_strength=args.osm_prior_strength,
-            osm_fallback_in_infer=not args.disable_osm_fallback,
-            lambda_min=args.lambda_min,
-            lambda_max=args.lambda_max
+            osm_fallback_in_infer=not args.disable_osm_fallback
         )
         
         _, update_time = measure_execution(bki.update, labels, points)
@@ -165,6 +164,7 @@ def run_point_scaling(scan_path, label_path, osm_path, config_path, args):
         
         results.append({
             "experiment": "point_scaling",
+            "scan": scan_name,
             "threads": -1,
             "points": size,
             "resolution": args.resolution,
@@ -177,9 +177,10 @@ def run_point_scaling(scan_path, label_path, osm_path, config_path, args):
         
     return results
 
-def run_resolution_scaling(scan_path, label_path, osm_path, config_path, args):
+def run_resolution_scaling(scan_path, label_path, osm_path, config_path, args, scan_name=None):
     """Benchmark performance and memory vs resolution."""
-    print("\n--- Resolution Scaling Benchmark ---")
+    scan_name = scan_name or scan_path.stem
+    print(f"\n--- Resolution Scaling Benchmark ({scan_name}) ---")
     
     points, _ = load_scan(str(scan_path))
     labels = load_labels(label_path)
@@ -196,7 +197,7 @@ def run_resolution_scaling(scan_path, label_path, osm_path, config_path, args):
         # Keep l_scale/resolution ratio fixed during resolution sweep
         effective_l_scale = args.l_scale * (res / args.resolution)
         start_init = time.perf_counter()
-        bki = composite_bki_cpp.PyContinuousBKI(
+        bki = osm_bki_cpp.PyContinuousBKI(
             osm_path=str(osm_path),
             config_path=str(config_path),
             resolution=res,
@@ -210,9 +211,7 @@ def run_resolution_scaling(scan_path, label_path, osm_path, config_path, args):
             alpha0=args.alpha0,
             seed_osm_prior=args.seed_osm_prior,
             osm_prior_strength=args.osm_prior_strength,
-            osm_fallback_in_infer=not args.disable_osm_fallback,
-            lambda_min=args.lambda_min,
-            lambda_max=args.lambda_max
+            osm_fallback_in_infer=not args.disable_osm_fallback
         )
         init_time = time.perf_counter() - start_init
         
@@ -226,6 +225,7 @@ def run_resolution_scaling(scan_path, label_path, osm_path, config_path, args):
         
         results.append({
             "experiment": "resolution_scaling",
+            "scan": scan_name,
             "threads": -1,
             "points": len(points),
             "resolution": res,
@@ -240,14 +240,28 @@ def run_resolution_scaling(scan_path, label_path, osm_path, config_path, args):
         
     return results
 
+def get_scan_label_pairs(scan_dir, label_dir):
+    """Return list of (scan_path, label_path) for scans that have matching labels."""
+    scan_dir = Path(scan_dir)
+    label_dir = Path(label_dir)
+    pairs = []
+    for scan_path in sorted(scan_dir.glob("*.bin")):
+        stem = scan_path.stem
+        label_path = find_label_file(label_dir, stem)
+        if label_path:
+            pairs.append((scan_path, Path(label_path)))
+    return pairs
+
+
 def main():
     parser = argparse.ArgumentParser(description="Throughput and Scaling Benchmark")
     
-    # Data paths
-    parser.add_argument("--scan", default="../example_data/mcd-data/data/0000000011.bin", help="Path to a single .bin scan")
-    parser.add_argument("--label", default="../example_data/mcd-data/labels_predicted/0000000011.bin", help="Path to corresponding label file")
+    # Data paths (directories)
+    parser.add_argument("--scan-dir", default="../example_data/mcd-data/data", help="Directory of .bin scans")
+    parser.add_argument("--label-dir", default="../example_data/mcd-data/labels_predicted", help="Directory of label files")
     parser.add_argument("--osm", default="../example_data/mcd-data/kth_day_06_osm_geometries.bin", help="Path to OSM geometries")
     parser.add_argument("--config", default="../configs/mcd_config.yaml", help="Path to YAML config")
+    parser.add_argument("--max-scans", type=int, default=None, help="Max scans to use (default: first scan only for throughput)")
     
     # Base BKI Parameters
     parser.add_argument("--resolution", type=float, default=1.0)
@@ -261,8 +275,6 @@ def main():
     parser.set_defaults(seed_osm_prior=True)
     parser.add_argument("--osm-prior-strength", type=float, default=0.1)
     parser.add_argument("--disable-osm-fallback", action="store_true")
-    parser.add_argument("--lambda-min", type=float, default=0.0)
-    parser.add_argument("--lambda-max", type=float, default=0.0)
     
     # Output
     parser.add_argument("--output", default=None, help="Output CSV file")
@@ -285,33 +297,40 @@ def main():
     
     # Resolve paths
     script_dir = Path(__file__).parent
-    scan_path = (script_dir / args.scan).resolve()
-    label_path = (script_dir / args.label).resolve()
+    scan_dir = (script_dir / args.scan_dir).resolve()
+    label_dir = (script_dir / args.label_dir).resolve()
     osm_path = (script_dir / args.osm).resolve()
     config_path = (script_dir / args.config).resolve()
     
     if not check_files_exist({
-        "Scan": scan_path,
-        "Label": label_path,
+        "Scan Dir": scan_dir,
+        "Label Dir": label_dir,
         "OSM": osm_path,
         "Config": config_path
     }):
         return 1
-        
+
+    pairs = get_scan_label_pairs(scan_dir, label_dir)
+    if not pairs:
+        print(f"❌ No matching scan/label pairs in {scan_dir} and {label_dir}")
+        return 1
+
+    max_scans = args.max_scans if args.max_scans is not None else 1
+    pairs = pairs[:max_scans]
+
     all_results = []
-    
     print(f"\n🚀 Starting Throughput Benchmark")
-    print(f"   Scan: {scan_path.name}")
+    print(f"   Scans: {len(pairs)} ({', '.join(p[0].name for p in pairs)})")
     print("-" * 60)
-    
-    # 1. Thread Scaling
-    all_results.extend(run_thread_scaling(scan_path, label_path, osm_path, config_path, args))
-    
-    # 2. Point Scaling
-    all_results.extend(run_point_scaling(scan_path, label_path, osm_path, config_path, args))
-    
-    # 3. Resolution Scaling
-    all_results.extend(run_resolution_scaling(scan_path, label_path, osm_path, config_path, args))
+
+    for scan_path, label_path in pairs:
+        scan_name = scan_path.stem
+        # 1. Thread Scaling
+        all_results.extend(run_thread_scaling(scan_path, label_path, osm_path, config_path, args, scan_name))
+        # 2. Point Scaling
+        all_results.extend(run_point_scaling(scan_path, label_path, osm_path, config_path, args, scan_name))
+        # 3. Resolution Scaling
+        all_results.extend(run_resolution_scaling(scan_path, label_path, osm_path, config_path, args, scan_name))
     
     # Write Results
     if args.output is None:
@@ -326,7 +345,7 @@ def main():
     print(f"\nWriting results to {output_csv}...")
     with open(output_csv, 'w', newline='') as f:
         fieldnames = [
-            "experiment", "threads", "points", "resolution", 
+            "experiment", "scan", "threads", "points", "resolution", 
             "init_time", "update_time", "infer_time", 
             "update_throughput", "infer_throughput", 
             "map_size", "memory_increase_mb"

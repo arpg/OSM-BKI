@@ -18,6 +18,7 @@ set(osm_bki_CORE_SOURCES
     src/continuous_bki.cpp
     src/file_io.cpp
     src/dataset_utils.cpp
+    src/osm_loader.cpp
 )
 
 add_library(osm_bki_core STATIC ${osm_bki_CORE_SOURCES})
@@ -25,6 +26,10 @@ target_include_directories(osm_bki_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+# Eigen3 for vectorized linear algebra
+find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+target_link_libraries(osm_bki_core PUBLIC Eigen3::Eigen)
 
 # OpenMP is optional; link it when available.
 find_package(OpenMP QUIET)

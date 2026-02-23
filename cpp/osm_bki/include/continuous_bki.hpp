@@ -9,15 +9,17 @@
 #ifndef CONTINUOUS_BKI_HPP
 #define CONTINUOUS_BKI_HPP
 
-#include <cstdint>
 #include <vector>
 #include <map>
-#include <unordered_map>
+#include "ankerl/unordered_dense.h"
 #include <string>
 #include <cmath>
 #include <algorithm>
 #include <iostream>
 #include <numeric>
+#include <chrono>
+#include <atomic>
+#include <Eigen/Core>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -104,6 +106,8 @@ struct Block {
     int last_updated = 0;
 };
 
+using BlockMap = ankerl::unordered_dense::map<BlockKey, Block, BlockKeyHasher>;
+
 // --- Main Class ---
 class ContinuousBKI {
 public:
@@ -120,9 +124,18 @@ public:
                   float alpha0 = 1.0f,
                   bool seed_osm_prior = false,
                   float osm_prior_strength = 0.0f,
-                  bool osm_fallback_in_infer = true,
-                  float lambda_min = 0.8f,
-                  float lambda_max = 0.99f);
+                  bool osm_fallback_in_infer = true);
+
+    // --- Templated update logic to reduce duplication ---
+    template <typename ValueType>
+    void update_impl(const std::vector<ValueType>& values,
+                     const std::vector<Point3D>& points,
+                     const std::vector<float>& weights,
+                     bool use_weights);
+
+    // --- Templated infer logic ---
+    template <typename ResultType>
+    std::vector<ResultType> infer_impl(const std::vector<Point3D>& points, bool return_probs) const;
 
     // Core Methods
     void update(const std::vector<uint32_t>& labels, const std::vector<Point3D>& points);
@@ -139,22 +152,6 @@ public:
     void clear();
     int size() const; // rough allocated voxel count
 
-private:
-    static constexpr int BLOCK_SIZE = 8;
-
-    // --- Integer helpers (correct for negatives) ---
-    static inline int div_floor(int a, int d) {
-        int q = a / d;
-        int r = a % d;
-        if (r != 0 && ((r > 0) != (d > 0))) q--;
-        return q;
-    }
-    static inline int mod_floor(int a, int d) {
-        int m = a - div_floor(a, d) * d;
-        if (m < 0) m += d;
-        return m;
-    }
-
     // --- Indexing helpers ---
     VoxelKey pointToKey(const Point3D& p) const;
     Point3D keyToPoint(const VoxelKey& k) const;
@@ -170,13 +167,12 @@ private:
     int getShardIndex(const BlockKey& bk) const;
 
     // block allocator/accessor (buffer versions avoid heap allocs during seeding)
-    Block& getOrCreateBlock(std::unordered_map<BlockKey, Block, BlockKeyHasher>& shard_map,
+    Block& getOrCreateBlock(BlockMap& shard_map,
                             const BlockKey& bk,
                             std::vector<float>& buf_m_i,
                             std::vector<float>& buf_p_super,
-                            std::vector<float>& buf_p_pred,
-                            int current_time) const;
-    const Block* getBlockConst(const std::unordered_map<BlockKey, Block, BlockKeyHasher>& shard_map, const BlockKey& bk) const;
+                            std::vector<float>& buf_p_pred) const;
+    const Block* getBlockConst(const BlockMap& shard_map, const BlockKey& bk) const;
 
     // Prior seeding (Dirichlet base + optional OSM mapped prior)
     void initVoxelAlpha(Block& b, int lx, int ly, int lz, const Point3D& center,
@@ -196,6 +192,38 @@ private:
     float getSemanticKernel(int matrix_idx, const std::vector<float>& m_i,
                             std::vector<float>& buf_expected_obs) const;
     float computeSpatialKernel(float dist_sq) const;
+
+    // --- Profiling ---
+    struct ProfilingStats {
+        double raster_build_ms = 0.0;
+        double total_update_ms = 0.0;
+        double total_semantic_precomp_ms = 0.0;
+        double total_shard_assign_ms = 0.0;
+        double total_kernel_update_ms = 0.0;
+        double total_infer_ms = 0.0;
+        int update_calls = 0;
+        int infer_calls = 0;
+        std::atomic<int> new_block_count{0};
+    };
+    mutable ProfilingStats profiling_;
+    void printProfilingStats() const;
+
+private:
+    static constexpr int BLOCK_SIZE = 8;
+    static constexpr int SPATIAL_KERNEL_LUT_SIZE = 1024;
+
+    // --- Integer helpers (correct for negatives) ---
+    static inline int div_floor(int a, int d) {
+        int q = a / d;
+        int r = a % d;
+        if (r != 0 && ((r > 0) != (d > 0))) q--;
+        return q;
+    }
+    static inline int mod_floor(int a, int d) {
+        int m = a - div_floor(a, d) * d;
+        if (m < 0) m += d;
+        return m;
+    }
 
     // --- Precomputed OSM prior raster ---
     struct OSMPriorRaster {
@@ -220,7 +248,7 @@ private:
     OSMData osm_data_;
 
     // Backend: sharded block hash maps
-    std::vector<std::unordered_map<BlockKey, Block, BlockKeyHasher>> block_shards_;
+    std::vector<BlockMap> block_shards_;
 
     // Params
     float resolution_;
@@ -238,8 +266,6 @@ private:
     bool seed_osm_prior_;
     float osm_prior_strength_;
     bool osm_fallback_in_infer_;
-    float lambda_min_;
-    float lambda_max_;
     int current_time_ = 0;
 
     // Derived
@@ -248,20 +274,15 @@ private:
 
     // Precomputed structures
     OSMPriorRaster osm_prior_raster_;
+    std::vector<float> spatial_kernel_lut_;
+    float inv_l_scale_sq_;
+
+    // Contiguous confusion matrix for SIMD matvec [K_pred x K_prior]
+    Eigen::MatrixXf confusion_matrix_;
 
     // Reverse mapping: confusion-matrix row index -> list of dense class indices
     std::vector<std::vector<int>> matrix_idx_to_dense_;
 };
-
-// Loaders
-OSMData loadOSMBinary(const std::string& filename,
-                      const std::map<std::string, int>& osm_class_map,
-                      const std::vector<std::string>& osm_categories);
-OSMData loadOSMXML(const std::string& filename,
-                   const Config& config);
-OSMData loadOSM(const std::string& filename,
-                const Config& config);
-Config loadConfigFromYAML(const std::string& config_path);
 
 } // namespace continuous_bki
 

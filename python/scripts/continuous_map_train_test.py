@@ -11,84 +11,13 @@ import os
 import sys
 import argparse
 import numpy as np
+import osm_bki_cpp
 from pathlib import Path
 
-# Optional: use transform from build_voxel_map if available
-try:
-    import pandas as pd
-    from scipy.spatial.transform import Rotation as R
-    _HAS_TRANSFORM = True
-except ImportError:
-    _HAS_TRANSFORM = False
-
-# Body to LiDAR transformation matrix for MCD dataset (same as build_voxel_map.py)
-BODY_TO_LIDAR_TF = np.array(
-    [
-        [0.9999135040741837, -0.011166365511073898, -0.006949579221822984, -0.04894521120494695],
-        [-0.011356389542502144, -0.9995453006865824, -0.02793249526856565, -0.03126929060348084],
-        [-0.006634514801117132, 0.02800900135032654, -0.999585653686922, -0.01755515794222565],
-        [0.0, 0.0, 0.0, 1.0],
-    ],
-    dtype=np.float64,
+from script_utils import (
+    load_body_to_lidar, load_poses_csv, transform_points_to_world,
+    load_scan, load_labels, find_label_file, get_frame_number, ConfigReader
 )
-
-
-def load_poses(pose_file):
-    """Load poses from CSV (num,t,x,y,z,qx,qy,qz,qw). Returns dict frame_num -> (7,) pose."""
-    if not _HAS_TRANSFORM:
-        raise RuntimeError("pandas and scipy are required for pose loading. pip install pandas scipy")
-    df = pd.read_csv(pose_file)
-    poses = {}
-    for _, row in df.iterrows():
-        frame_num = int(row["num"])
-        x, y, z = float(row["x"]), float(row["y"]), float(row["z"])
-        qx, qy, qz, qw = float(row["qx"]), float(row["qy"]), float(row["qz"]), float(row["qw"])
-        poses[frame_num] = np.array([x, y, z, qx, qy, qz, qw])
-    return poses
-
-
-def transform_points_to_world(points, pose):
-    """LiDAR -> Body -> World using MCD calibration. points (N,3), pose (7,) [x,y,z,qx,qy,qz,qw]."""
-    position = pose[:3]
-    quat = pose[3:7]
-    body_rotation_matrix = R.from_quat(quat).as_matrix()
-    body_to_world = np.eye(4, dtype=np.float64)
-    body_to_world[:3, :3] = body_rotation_matrix
-    body_to_world[:3, 3] = np.asarray(position, dtype=np.float64)
-    lidar_to_body = np.linalg.inv(BODY_TO_LIDAR_TF)
-    transform_matrix = body_to_world @ lidar_to_body
-    points_homogeneous = np.hstack([np.asarray(points, dtype=np.float64), np.ones((points.shape[0], 1))])
-    world_points = (transform_matrix @ points_homogeneous.T).T
-    return world_points[:, :3].astype(np.float32)
-
-
-def load_scan(bin_path):
-    """Load point cloud (N,4) and return (N,3) xyz, (N,) intensity."""
-    scan = np.fromfile(bin_path, dtype=np.float32).reshape(-1, 4)
-    return scan[:, :3], scan[:, 3]
-
-
-def load_labels(label_path):
-    """Load semantic labels; lower 16 bits (same as build_voxel_map)."""
-    raw = np.fromfile(label_path, dtype=np.uint32)
-    return (raw & 0xFFFF).astype(np.uint32)
-
-
-def find_label_file(label_dir, scan_stem):
-    """Find label file for a scan; try .label, .bin, _prediction.label, _prediction.bin."""
-    exts = [".label", ".bin", "_prediction.label", "_prediction.bin"]
-    for ext in exts:
-        p = Path(label_dir) / f"{scan_stem}{ext}"
-        if p.exists():
-            return str(p)
-    return None
-
-
-def get_frame_number(stem):
-    try:
-        return int(stem)
-    except ValueError:
-        return None
 
 
 def compute_metrics(pred, gt, ignore_label=0):
@@ -123,6 +52,7 @@ def main():
     parser.add_argument("--osm", required=True, help="Path to OSM geometries (.bin or .osm XML)")
     parser.add_argument("--config", required=True, help="Path to YAML config")
     parser.add_argument("--pose", default=None, help="CSV poses (num,t,x,y,z,qx,qy,qz,qw) for world-frame transform (optional)")
+    parser.add_argument("--calib", default="example_data/hhs_calib.yaml", help="Path to hhs_calib.yaml (body→LiDAR calibration, body/os_sensor/T)")
     parser.add_argument("--gt-dir", default=None, help="Optional: directory of ground-truth labels for test half metrics")
     parser.add_argument("--output-dir", default=None, help="Optional: save refined labels for test scans here")
     parser.add_argument("--map-state", default=None, help="Optional: path to save trained map state")
@@ -138,23 +68,14 @@ def main():
     parser.add_argument("--seed-osm-prior", type=bool, default=False, help="Enable OSM prior seeding")
     parser.add_argument("--osm-prior-strength", type=float, default=0.0, help="OSM prior strength")
     parser.add_argument("--disable-osm-fallback", type=bool, default=False, help="Disable OSM fallback during inference")
-    parser.add_argument("--lambda-min", type=float, default=0.8, help="Min forgetting factor (for high confidence OSM areas)")
-    parser.add_argument("--lambda-max", type=float, default=0.99, help="Max forgetting factor (for low confidence OSM areas)")
+    parser.add_argument("--init_rel_pos", type=float, nargs=3, metavar=('X', 'Y', 'Z'), default=None,
+                        help="World-frame initial position to subtract from poses "
+                             "(overrides init_rel_pos_day_06 in config YAML)")
+    parser.add_argument("--osm_origin_lat", type=float, default=None,
+                        help="Override OSM projection origin latitude (read from config YAML if not given)")
+    parser.add_argument("--osm_origin_lon", type=float, default=None,
+                        help="Override OSM projection origin longitude (read from config YAML if not given)")
     args = parser.parse_args()
-
-    if args.pose and not _HAS_TRANSFORM:
-        print("ERROR: --pose requires pandas and scipy. pip install pandas scipy", file=sys.stderr)
-        return 1
-
-    try:
-        import composite_bki_cpp
-    except ImportError:
-        sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
-        try:
-            import composite_bki_cpp
-        except ImportError:
-            print("ERROR: composite_bki_cpp not found. Install the package or run from repo root with PYTHONPATH=src", file=sys.stderr)
-            return 1
 
     scan_dir = Path(args.scan_dir)
     label_dir = Path(args.label_dir)
@@ -218,13 +139,32 @@ def main():
         f"({pct_total:.1f}% of total, {pct_candidates:.1f}% of candidate test set)."
     )
 
+    # Resolve init_rel_pos: CLI overrides config YAML's init_rel_pos_day_06
+    init_rel_pos = None
+    if args.init_rel_pos is not None:
+        init_rel_pos = np.array(args.init_rel_pos, dtype=np.float64)
+    else:
+        init_rel_pos = ConfigReader(args.config).init_rel_pos
+        if init_rel_pos is not None:
+            init_rel_pos = init_rel_pos.astype(np.float64)
+
+    if init_rel_pos is not None:
+        print(f"init_rel_pos = [{init_rel_pos[0]:.4f}, {init_rel_pos[1]:.4f}, {init_rel_pos[2]:.4f}]")
+    else:
+        print("No init_rel_pos; poses used as-is (no world-frame re-zeroing).")
+
     poses = None
+    body_to_lidar = None
     if args.pose:
         if not os.path.exists(args.pose):
             print(f"Pose file not found: {args.pose}", file=sys.stderr)
             return 1
-        poses = load_poses(args.pose)
-        print(f"Loaded {len(poses)} poses; transforming scans to world frame.")
+        if not os.path.exists(args.calib):
+            print(f"Calibration file not found: {args.calib}", file=sys.stderr)
+            return 1
+        poses = load_poses_csv(args.pose)
+        body_to_lidar = load_body_to_lidar(args.calib)
+        print(f"Loaded {len(poses)} poses; transforming scans to world frame using {args.calib}")
     else:
         print("No --pose provided; using scan coordinates as-is (sensor frame).")
 
@@ -239,7 +179,7 @@ def main():
         return 1
 
     def train_bki(use_semantic_kernel):
-        bki = composite_bki_cpp.PyContinuousBKI(
+        bki = osm_bki_cpp.PyContinuousBKI(
             osm_path=args.osm,
             config_path=args.config,
             resolution=args.resolution,
@@ -252,9 +192,7 @@ def main():
             alpha0=args.alpha0,
             seed_osm_prior=args.seed_osm_prior,
             osm_prior_strength=args.osm_prior_strength,
-            osm_fallback_in_infer=not args.disable_osm_fallback,
-            lambda_min=args.lambda_min,
-            lambda_max=args.lambda_max
+            osm_fallback_in_infer=not args.disable_osm_fallback
         )
         for scan_path in train_files:
             stem = scan_path.stem
@@ -269,7 +207,7 @@ def main():
                 points_xyz = points_xyz[:min_len]
                 labels = labels[:min_len]
             if poses is not None and frame is not None and frame in poses:
-                points_xyz = transform_points_to_world(points_xyz, poses[frame])
+                points_xyz = transform_points_to_world(points_xyz, poses[frame], body_to_lidar, init_rel_pos)
             bki.update(labels, points_xyz)
         return bki
 
@@ -287,7 +225,7 @@ def main():
     # To disable spatial kernel, we need to modify train_bki or create a new instance
     # Let's modify train_bki to accept use_spatial_kernel
     def train_bki_custom(use_semantic_kernel, use_spatial_kernel):
-        bki = composite_bki_cpp.PyContinuousBKI(
+        bki = osm_bki_cpp.PyContinuousBKI(
             osm_path=args.osm,
             config_path=args.config,
             resolution=args.resolution,
@@ -300,9 +238,7 @@ def main():
             alpha0=args.alpha0,
             seed_osm_prior=args.seed_osm_prior,
             osm_prior_strength=args.osm_prior_strength,
-            osm_fallback_in_infer=not args.disable_osm_fallback,
-            lambda_min=args.lambda_min,
-            lambda_max=args.lambda_max
+            osm_fallback_in_infer=not args.disable_osm_fallback
         )
         for scan_path in train_files:
             stem = scan_path.stem
@@ -317,7 +253,7 @@ def main():
                 points_xyz = points_xyz[:min_len]
                 labels = labels[:min_len]
             if poses is not None and frame is not None and frame in poses:
-                points_xyz = transform_points_to_world(points_xyz, poses[frame])
+                points_xyz = transform_points_to_world(points_xyz, poses[frame], body_to_lidar, init_rel_pos)
             bki.update(labels, points_xyz)
         return bki
 
@@ -347,7 +283,7 @@ def main():
         frame = get_frame_number(stem)
         points_xyz, _ = load_scan(str(scan_path))
         if poses is not None and frame is not None and frame in poses:
-            points_xyz = transform_points_to_world(points_xyz, poses[frame])
+            points_xyz = transform_points_to_world(points_xyz, poses[frame], body_to_lidar, init_rel_pos)
 
         pred_sem = bki_sem.infer(points_xyz)
         pred_nosem = bki_nosem.infer(points_xyz)

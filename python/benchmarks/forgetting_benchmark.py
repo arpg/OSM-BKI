@@ -2,8 +2,7 @@
 """
 Forgetting Factor Sweep Benchmark.
 
-Evaluates the effect of the forgetting mechanism (lambda_min, lambda_max) on map quality over time.
-Tests different decay rates to find the optimal balance between stability and plasticity.
+Evaluates map quality over time across different configuration presets.
 """
 
 import sys
@@ -14,9 +13,9 @@ from pathlib import Path
 from datetime import datetime
 import time
 
-# Add parent directory to path to import composite_bki_cpp
+# Add parent directory to path to import osm_bki_cpp
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-import composite_bki_cpp
+import osm_bki_cpp
 
 # Import benchmark utilities
 from benchmark_utils import (
@@ -64,12 +63,12 @@ def run_evaluation(bki, test_files, label_dir, gt_dir, poses):
     
     return avg_acc, avg_miou
 
-def run_config(config_name, lambda_min, lambda_max, scan_files, label_dir, gt_dir, poses, osm_path, config_path, args):
+def run_config(config_name, scan_files, label_dir, gt_dir, poses, osm_path, config_path, args):
     """Run a single configuration."""
-    print(f"\nRunning Config: {config_name} (min={lambda_min}, max={lambda_max})...")
+    print(f"\nRunning Config: {config_name}...")
     
     # Initialize BKI
-    bki = composite_bki_cpp.PyContinuousBKI(
+    bki = osm_bki_cpp.PyContinuousBKI(
         osm_path=str(osm_path),
         config_path=str(config_path),
         resolution=args.resolution,
@@ -83,9 +82,7 @@ def run_config(config_name, lambda_min, lambda_max, scan_files, label_dir, gt_di
         alpha0=args.alpha0,
         seed_osm_prior=args.seed_osm_prior,
         osm_prior_strength=args.osm_prior_strength,
-        osm_fallback_in_infer=not args.disable_osm_fallback,
-        lambda_min=lambda_min,
-        lambda_max=lambda_max
+        osm_fallback_in_infer=not args.disable_osm_fallback
     )
     
     results = []
@@ -121,8 +118,6 @@ def run_config(config_name, lambda_min, lambda_max, scan_files, label_dir, gt_di
             
             results.append({
                 "config": config_name,
-                "lambda_min": lambda_min,
-                "lambda_max": lambda_max,
                 "scans_integrated": scan_idx,
                 "accuracy": acc,
                 "miou": miou,
@@ -208,11 +203,11 @@ def main():
         
     # Define Configurations
     configs = [
-        ("No Forgetting", 1.0, 1.0),
-        ("Mild", 0.95, 0.99),
-        ("Default", 0.8, 0.99),
-        ("Aggressive", 0.5, 0.95),
-        ("Very Aggressive", 0.3, 0.8)
+        "No Forgetting",
+        "Mild",
+        "Default",
+        "Aggressive",
+        "Very Aggressive"
     ]
     
     all_results = []
@@ -222,8 +217,8 @@ def main():
     print(f"   Checkpoints: {args.checkpoints}")
     print("-" * 60)
     
-    for name, l_min, l_max in configs:
-        res = run_config(name, l_min, l_max, scan_files, label_dir, gt_dir, poses, osm_path, config_path, args)
+    for name in configs:
+        res = run_config(name, scan_files, label_dir, gt_dir, poses, osm_path, config_path, args)
         all_results.extend(res)
         
     # Write Results
@@ -238,7 +233,7 @@ def main():
         
     print(f"\nWriting results to {output_csv}...")
     with open(output_csv, 'w', newline='') as f:
-        fieldnames = ["config", "lambda_min", "lambda_max", "scans_integrated", "accuracy", "miou", "map_size", "time_elapsed"]
+        fieldnames = ["config", "scans_integrated", "accuracy", "miou", "map_size", "time_elapsed"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_results)

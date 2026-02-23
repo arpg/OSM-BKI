@@ -5,10 +5,10 @@ Benchmark Composite BKI performance across different noise levels.
 This script:
 1. Generates noisy labels at different noise percentages (logic in this script)
 2. Runs Composite BKI refinement on each
-3. Evaluates against ground truth (using composite_bki.py metrics logic)
+3. Evaluates against ground truth (using osm_bki metrics logic)
 4. Outputs results to CSV
 
-NOTE: This benchmark maintains 1:1 logic parity with composite_bki.py:
+NOTE: This benchmark maintains 1:1 logic parity with osm_bki:
 - Noise generation: Matches the standalone noise script logic
 - Metrics calculation: Uses same compute_metrics logic (skips class 0, only GT classes)
 - BKI parameters: l_scale=3.0, sigma_0=1.0, prior_delta=5.0, alpha_0=0.01
@@ -20,9 +20,11 @@ import csv
 from pathlib import Path
 from datetime import datetime
 
-# Add parent directory to path to import composite_bki_cpp
+# Add parent directory to path to import osm_bki_cpp
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-import composite_bki_cpp
+import osm_bki_cpp
+
+from benchmark_utils import find_label_file
 
 
 # SemanticKITTI valid classes for noise generation
@@ -104,9 +106,9 @@ def add_noise(labels_raw, noise_percent, noise_pool):
 
 def calculate_metrics(pred_labels, gt_labels):
     """
-    Calculate accuracy and mIoU (matches composite_bki.py::compute_metrics exactly).
+    Calculate accuracy and mIoU (matches osm_bki::compute_metrics exactly).
     
-    This function is a 1:1 copy of the compute_metrics function from composite_bki.py
+    This function is a 1:1 copy of the compute_metrics function from osm_bki
     to ensure identical evaluation logic. Key behaviors:
     - Only evaluates classes present in ground truth (unique_gt)
     - Skips class 0 (unlabeled/invalid)
@@ -130,7 +132,7 @@ def calculate_metrics(pred_labels, gt_labels):
     unique_gt = np.unique(gt_labels)
     
     for cls in unique_gt:
-        if cls == 0:  # Skip class 0 (matches composite_bki.py line 292)
+        if cls == 0:  # Skip class 0 (matches osm_bki line 292)
             continue
         
         gt_mask = (gt_labels == cls)
@@ -173,7 +175,7 @@ def run_single_benchmark(
     noisy_labels_path
 ):
     """
-    Run a single benchmark iteration (matches composite_bki.py parameters).
+    Run a single benchmark iteration (matches osm_bki parameters).
     
     Args:
         lidar_path: path to LiDAR data
@@ -195,9 +197,9 @@ def run_single_benchmark(
     # Save noisy labels (persistent, not temporary)
     noisy_labels_raw.tofile(noisy_labels_path)
     
-    # Run refinement with parameters matching composite_bki.py defaults
+    # Run refinement with parameters matching osm_bki defaults
     # Using PyContinuousBKI directly instead of run_pipeline
-    bki = composite_bki_cpp.PyContinuousBKI(
+    bki = osm_bki_cpp.PyContinuousBKI(
         osm_path=str(osm_path),
         config_path=str(config_path),
         resolution=1.0,     # Standard resolution
@@ -242,55 +244,68 @@ def run_single_benchmark(
         'after': metrics_after
     }
 
+def get_scan_gt_pairs(scan_dir, gt_dir):
+    """Return list of (scan_path, gt_path) for scans that have matching GT labels."""
+    scan_dir = Path(scan_dir)
+    gt_dir = Path(gt_dir)
+    pairs = []
+    for scan_path in sorted(scan_dir.glob("*.bin")):
+        stem = scan_path.stem
+        gt_path = find_label_file(gt_dir, stem)
+        if gt_path:
+            pairs.append((scan_path, Path(gt_path)))
+    return pairs
+
+
 def run_benchmark(
-    lidar_path,
-    gt_labels_path,
+    scan_dir,
+    gt_dir,
     osm_path,
     config_path,
     noise_levels,
     output_csv,
     num_runs=3,
-    use_kitti=False
+    use_kitti=False,
+    max_scans=None
 ):
     """
     Run benchmark across different noise levels.
     
     Args:
-        lidar_path: path to LiDAR point cloud (.bin)
-        gt_labels_path: path to ground truth labels
+        scan_dir: directory of LiDAR point clouds (.bin)
+        gt_dir: directory of ground truth labels
         osm_path: path to OSM geometries
         config_path: path to config YAML
         noise_levels: list of noise percentages to test
         output_csv: path to output CSV file
         num_runs: number of runs per noise level for averaging
         use_kitti: if True, use SemanticKITTI class list for noise
+        max_scans: max scans to process (default: all)
     """
     print("=" * 80)
     print("Composite BKI Noise Benchmark")
     print("=" * 80)
     print()
     
+    pairs = get_scan_gt_pairs(scan_dir, gt_dir)
+    if not pairs:
+        raise FileNotFoundError(f"No matching scan/GT pairs in {scan_dir} and {gt_dir}")
+    if max_scans is not None:
+        pairs = pairs[:max_scans]
+    
     # Check files exist
     if not check_files_exist({
-        "LiDAR data": Path(lidar_path),
-        "Ground truth labels": Path(gt_labels_path),
+        "Scan Dir": Path(scan_dir),
+        "GT Dir": Path(gt_dir),
         "OSM geometries": Path(osm_path),
         "Config": Path(config_path)
     }):
         raise FileNotFoundError("Required files missing")
     
-    # Load data
-    print("Loading data...")
-    lidar_data = np.fromfile(lidar_path, dtype=np.float32).reshape((-1, 4))
-    gt_raw = np.fromfile(gt_labels_path, dtype=np.uint32)
-    gt_labels = (gt_raw & 0xFFFF).astype(np.uint32)
+    print(f"Processing {len(pairs)} scans...")
     
-    print(f"  LiDAR points: {len(lidar_data)}")
-    print(f"  Ground truth labels: {len(gt_labels)}")
-    print()
-    
-    # Prepare results
-    results = []
+    # Prepare results: collect per-scan, per-noise-level, per-run
+    all_run_results = []  # list of (scan_stem, noise_level, run_idx, metrics)
     
     # Create directory for noisy labels
     noisy_labels_dir = Path(output_csv).parent / "noisy_labels"
@@ -298,44 +313,38 @@ def run_benchmark(
     print(f"Saving noisy labels to: {noisy_labels_dir}")
     print()
     
-    # Test each noise level
     noise_pool = VALID_CLASSES if use_kitti else MCD_CLASSES
+
+    for scan_path, gt_path in pairs:
+        scan_stem = scan_path.stem
+        gt_raw = np.fromfile(gt_path, dtype=np.uint32)
+        gt_labels = (gt_raw & 0xFFFF).astype(np.uint32)
+        print(f"Scan {scan_stem}: {len(gt_labels)} points")
+
+        for noise_level in noise_levels:
+            for run in range(num_runs):
+                noisy_labels_raw = add_noise(gt_raw, noise_level, noise_pool)
+                noisy_labels_path = noisy_labels_dir / f"{scan_stem}_noisy_{int(noise_level)}pct_run{run}.labels"
+
+                metrics = run_single_benchmark(
+                    lidar_path=scan_path,
+                    noisy_labels_raw=noisy_labels_raw,
+                    gt_labels=gt_labels,
+                    osm_path=osm_path,
+                    config_path=config_path,
+                    noisy_labels_path=noisy_labels_path
+                )
+                all_run_results.append((scan_stem, noise_level, run, metrics))
+
+    # Aggregate by noise level (across scans and runs)
+    results = []
     for noise_level in noise_levels:
-        print(f"Testing {noise_level}% noise level...")
-        
-        run_results = []
-        
-        # Run multiple times and average
-        for run in range(num_runs):
-            print(f"  Run {run + 1}/{num_runs}...", end=" ")
-            
-            # Generate noisy labels (matches the standalone noise logic)
-            noisy_labels_raw = add_noise(gt_raw, noise_level, noise_pool)
-            
-            # File path for noisy labels (persistent)
-            noisy_labels_path = noisy_labels_dir / f"noisy_{int(noise_level)}pct_run{run}.labels"
-            
-            # Run benchmark
-            metrics = run_single_benchmark(
-                lidar_path=lidar_path,
-                noisy_labels_raw=noisy_labels_raw,
-                gt_labels=gt_labels,
-                osm_path=osm_path,
-                config_path=config_path,
-                noisy_labels_path=noisy_labels_path
-            )
-            
-            run_results.append(metrics)
-            
-            print(f"Before: Acc={metrics['before']['accuracy']*100:.2f}%, mIoU={metrics['before']['miou']*100:.2f}% | "
-                  f"After: Acc={metrics['after']['accuracy']*100:.2f}%, mIoU={metrics['after']['miou']*100:.2f}%")
-        
-        # Aggregate results across runs
-        accuracies_before = [r['before']['accuracy'] for r in run_results]
-        mious_before = [r['before']['miou'] for r in run_results]
-        accuracies_after = [r['after']['accuracy'] for r in run_results]
-        mious_after = [r['after']['miou'] for r in run_results]
-        
+        level_results = [r for r in all_run_results if r[1] == noise_level]
+        accuracies_before = [r[3]['before']['accuracy'] for r in level_results]
+        mious_before = [r[3]['before']['miou'] for r in level_results]
+        accuracies_after = [r[3]['after']['accuracy'] for r in level_results]
+        mious_after = [r[3]['after']['miou'] for r in level_results]
+
         results.append({
             'noise_level': noise_level,
             'accuracy_before': np.mean(accuracies_before),
@@ -349,15 +358,10 @@ def run_benchmark(
             'accuracy_after_std': np.std(accuracies_after),
             'miou_after_std': np.std(mious_after)
         })
-        
         result = results[-1]
-        print(f"  Average BEFORE - Accuracy: {result['accuracy_before']*100:.2f}% (±{result['accuracy_before_std']*100:.2f}%), "
-              f"mIoU: {result['miou_before']*100:.2f}% (±{result['miou_before_std']*100:.2f}%)")
-        print(f"  Average AFTER  - Accuracy: {result['accuracy_after']*100:.2f}% (±{result['accuracy_after_std']*100:.2f}%), "
-              f"mIoU: {result['miou_after']*100:.2f}% (±{result['miou_after_std']*100:.2f}%)")
-        print(f"  Improvement    - Accuracy: {result['accuracy_improvement']*100:+.2f}%, "
-              f"mIoU: {result['miou_improvement']*100:+.2f}%")
-        print()
+        print(f"Noise {noise_level}%: Before Acc={result['accuracy_before']*100:.2f}%, mIoU={result['miou_before']*100:.2f}% | "
+              f"After Acc={result['accuracy_after']*100:.2f}%, mIoU={result['miou_after']*100:.2f}% | "
+              f"Δ Acc={result['accuracy_improvement']*100:+.2f}%, mIoU={result['miou_improvement']*100:+.2f}%")
     
     # Write results to CSV
     print(f"Writing results to {output_csv}...")
@@ -423,17 +427,24 @@ def main():
     )
     
     parser.add_argument(
-        "--lidar",
+        "--scan-dir",
         type=str,
-        default="../example_data/mcd-data/data/0000000011.bin",
-        help="Path to LiDAR point cloud (.bin)"
+        default="../example_data/mcd-data/data",
+        help="Directory of LiDAR point clouds (.bin)"
     )
     
     parser.add_argument(
-        "--gt-labels",
+        "--gt-dir",
         type=str,
-        default="../example_data/mcd-data/labels_groundtruth/0000000011.bin",
-        help="Path to ground truth labels"
+        default="../example_data/mcd-data/labels_groundtruth",
+        help="Directory of ground truth labels"
+    )
+    
+    parser.add_argument(
+        "--max-scans",
+        type=int,
+        default=None,
+        help="Max scans to process (default: all)"
     )
     
     parser.add_argument(
@@ -489,21 +500,22 @@ def main():
     
     # Convert relative paths to absolute
     script_dir = Path(__file__).parent
-    lidar_path = (script_dir / args.lidar).resolve()
-    gt_labels_path = (script_dir / args.gt_labels).resolve()
+    scan_dir = (script_dir / args.scan_dir).resolve()
+    gt_dir = (script_dir / args.gt_dir).resolve()
     osm_path = (script_dir / args.osm).resolve()
     config_path = (script_dir / args.config).resolve()
     
     # Run benchmark
     run_benchmark(
-        lidar_path=lidar_path,
-        gt_labels_path=gt_labels_path,
+        scan_dir=scan_dir,
+        gt_dir=gt_dir,
         osm_path=osm_path,
         config_path=config_path,
         noise_levels=args.noise_levels,
         output_csv=output_csv,
         num_runs=args.runs,
-        use_kitti=args.kitti_labels
+        use_kitti=args.kitti_labels,
+        max_scans=args.max_scans
     )
 
 

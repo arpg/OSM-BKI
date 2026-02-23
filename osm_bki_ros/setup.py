@@ -2,7 +2,7 @@ from setuptools import setup
 import os
 from glob import glob
 
-package_name = 'composite_bki_ros'
+package_name = 'osm_bki_ros'
 
 setup(
     name=package_name,
@@ -19,12 +19,12 @@ setup(
     zip_safe=True,
     maintainer='User',
     maintainer_email='user@example.com',
-    description='ROS2 node for Composite BKI',
+    description='ROS2 node for OSM-BKI',
     license='MIT',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'simple_node = composite_bki_ros.simple_node:main',
+            'simple_node = osm_bki_ros.simple_node:main',
         ],
     },
 )

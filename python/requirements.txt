@@ -1,0 +1,17 @@
+# Core (required for build and runtime)
+numpy>=1.20.0
+pybind11>=2.6.0
+
+# Scripts and benchmarks
+pandas>=1.0.0
+scipy>=1.5.0
+PyYAML>=5.0
+open3d>=0.13.0
+
+# Confusion matrix evaluation (scripts/confusion_matrix_eval.py)
+matplotlib>=3.0
+seaborn>=0.11
+scikit-learn>=0.24
+
+# Optional: memory measurements in throughput_benchmark
+psutil>=5.0

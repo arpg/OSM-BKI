@@ -1,6 +1,6 @@
 """
-Build the composite_bki_cpp extension (pybind11) and install osm_bki package.
-Scripts expect: import composite_bki_cpp; composite_bki_cpp.run_pipeline(...); composite_bki_cpp.PySemanticBKI(...)
+Build the osm_bki_cpp extension (pybind11) and install osm_bki package.
+Scripts expect: import osm_bki_cpp; osm_bki_cpp.PyContinuousBKI(...)
 """
 
 import atexit
@@ -66,8 +66,7 @@ def get_sources():
     sources = [
         str(pybind_src),
         str(cpp_src / "continuous_bki.cpp"),
-        str(cpp_src / "file_io.cpp"),
-        str(cpp_src / "dataset_utils.cpp"),
+        str(cpp_src / "osm_loader.cpp"),
     ]
     for s in sources:
         if not Path(s).exists():
@@ -105,11 +104,12 @@ def extra_link_args():
 
 
 ext = Extension(
-    "composite_bki_cpp",
+    "osm_bki_cpp",
     sources=get_sources(),
     include_dirs=[
         get_pybind_include(),
         *get_include_dirs(),
+        "/usr/include/eigen3",
     ],
     language="c++",
     extra_compile_args=extra_compile_args(),
@@ -119,8 +119,8 @@ ext = Extension(
 setup(
     name="osm_bki",
     version="2.0.0",
-    description="OSM-S-BKI / Composite BKI: semantic BKI for LiDAR with OSM priors",
-    author="Composite BKI Team",
+    description="OSM-BKI: semantic BKI for LiDAR with OSM priors",
+    author="OSM-BKI Team",
     license="MIT",
     python_requires=">=3.7",
     packages=["osm_bki"],

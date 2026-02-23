@@ -16,9 +16,11 @@ import csv
 from pathlib import Path
 from datetime import datetime
 
-# Add parent directory to path to import composite_bki_cpp
+# Add parent directory to path to import osm_bki_cpp
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-import composite_bki_cpp
+import osm_bki_cpp
+
+from benchmark_utils import find_label_file
 
 
 # SemanticKITTI valid classes for noise generation
@@ -75,7 +77,7 @@ def add_noise(labels_raw, noise_percent, noise_pool):
 
 
 def calculate_metrics(pred_labels, gt_labels):
-    """Calculate accuracy and mIoU (matches composite_bki.py logic exactly)."""
+    """Calculate accuracy and mIoU (matches osm_bki logic exactly)."""
     intersection = {}
     union = {}
     correct = {}
@@ -158,7 +160,7 @@ def run_single_config(
     
     # Run refinement with specified kernel configuration
     # Using PyContinuousBKI directly
-    bki = composite_bki_cpp.PyContinuousBKI(
+    bki = osm_bki_cpp.PyContinuousBKI(
         osm_path=str(osm_path),
         config_path=str(config_path),
         resolution=1.0,
@@ -206,15 +208,29 @@ def run_single_config(
     }
 
 
+def get_scan_gt_pairs(scan_dir, gt_dir):
+    """Return list of (scan_path, gt_path) for scans that have matching GT labels."""
+    scan_dir = Path(scan_dir)
+    gt_dir = Path(gt_dir)
+    pairs = []
+    for scan_path in sorted(scan_dir.glob("*.bin")):
+        stem = scan_path.stem
+        gt_path = find_label_file(gt_dir, stem)
+        if gt_path:
+            pairs.append((scan_path, Path(gt_path)))
+    return pairs
+
+
 def run_ablation_study(
-    lidar_path,
-    gt_labels_path,
+    scan_dir,
+    gt_dir,
     osm_path,
     config_path,
     noise_levels,
     output_csv,
     num_runs=3,
-    use_kitti=False
+    use_kitti=False,
+    max_scans=None
 ):
     """
     Run kernel ablation study across different noise levels.
@@ -229,24 +245,22 @@ def run_ablation_study(
     print("=" * 80)
     print()
     
+    pairs = get_scan_gt_pairs(scan_dir, gt_dir)
+    if not pairs:
+        raise FileNotFoundError(f"No matching scan/GT pairs in {scan_dir} and {gt_dir}")
+    if max_scans is not None:
+        pairs = pairs[:max_scans]
+    
     # Check files exist
     if not check_files_exist({
-        "LiDAR data": Path(lidar_path),
-        "Ground truth labels": Path(gt_labels_path),
+        "Scan Dir": Path(scan_dir),
+        "GT Dir": Path(gt_dir),
         "OSM geometries": Path(osm_path),
         "Config": Path(config_path)
     }):
         raise FileNotFoundError("Required files missing")
     
-    # Load data
-    print("Loading data...")
-    lidar_data = np.fromfile(lidar_path, dtype=np.float32).reshape((-1, 4))
-    gt_raw = np.fromfile(gt_labels_path, dtype=np.uint32)
-    gt_labels = (gt_raw & 0xFFFF).astype(np.uint32)
-    
-    print(f"  LiDAR points: {len(lidar_data)}")
-    print(f"  Ground truth labels: {len(gt_labels)}")
-    print()
+    print(f"Processing {len(pairs)} scans...")
     
     # Create directory for noisy labels
     noisy_labels_dir = Path(output_csv).parent / "ablation_noisy_labels"
@@ -260,50 +274,42 @@ def run_ablation_study(
     ]
     
     results = []
-    
     noise_pool = VALID_CLASSES if use_kitti else MCD_CLASSES
 
-    # Test each noise level
-    for noise_level in noise_levels:
-        print(f"Testing {noise_level}% noise level...")
-        
-        # Run multiple times and average
-        for run in range(num_runs):
-            print(f"  Run {run + 1}/{num_runs}:")
-            
-            # Generate noisy labels
-            noisy_labels_raw = add_noise(gt_raw, noise_level, noise_pool)
-            
-            # Save noisy labels
-            noisy_labels_path = noisy_labels_dir / f"noisy_{int(noise_level)}pct_run{run}.labels"
-            noisy_labels_raw.tofile(noisy_labels_path)
-            
-            # Test each kernel configuration
-            run_results = []
-            for config_name, use_semantic, use_spatial in configs:
-                result = run_single_config(
-                    lidar_path=lidar_path,
-                    noisy_labels_path=noisy_labels_path,
-                    gt_labels=gt_labels,
-                    osm_path=osm_path,
-                    config_path=config_path,
-                    use_semantic_kernel=use_semantic,
-                    use_spatial_kernel=use_spatial,
-                    config_name=config_name
-                )
-                result['noise_level'] = noise_level
-                result['run'] = run
-                run_results.append(result)
-            
-            results.extend(run_results)
-            print()
+    for scan_path, gt_path in pairs:
+        scan_stem = scan_path.stem
+        gt_raw = np.fromfile(gt_path, dtype=np.uint32)
+        gt_labels = (gt_raw & 0xFFFF).astype(np.uint32)
+        print(f"Scan {scan_stem}: {len(gt_labels)} points")
+
+        for noise_level in noise_levels:
+            for run in range(num_runs):
+                noisy_labels_raw = add_noise(gt_raw, noise_level, noise_pool)
+                noisy_labels_path = noisy_labels_dir / f"{scan_stem}_noisy_{int(noise_level)}pct_run{run}.labels"
+                noisy_labels_raw.tofile(noisy_labels_path)
+
+                for config_name, use_semantic, use_spatial in configs:
+                    result = run_single_config(
+                        lidar_path=scan_path,
+                        noisy_labels_path=noisy_labels_path,
+                        gt_labels=gt_labels,
+                        osm_path=osm_path,
+                        config_path=config_path,
+                        use_semantic_kernel=use_semantic,
+                        use_spatial_kernel=use_spatial,
+                        config_name=config_name
+                    )
+                    result['noise_level'] = noise_level
+                    result['run'] = run
+                    result['scan'] = scan_stem
+                    results.append(result)
     
     # Write detailed results to CSV
     print(f"Writing results to {output_csv}...")
     with open(output_csv, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
-            'Noise_Level', 'Run', 'Configuration',
+            'Scan', 'Noise_Level', 'Run', 'Configuration',
             'Use_Semantic', 'Use_Spatial',
             'Accuracy_Before', 'mIoU_Before',
             'Accuracy_After', 'mIoU_After',
@@ -312,6 +318,7 @@ def run_ablation_study(
         
         for result in results:
             writer.writerow([
+                result['scan'],
                 result['noise_level'],
                 result['run'],
                 result['config_name'],
@@ -342,9 +349,9 @@ def run_ablation_study(
         print("-" * 64)
         
         for config_name, use_semantic, use_spatial in configs:
-            # Filter results for this noise level and config
-            filtered = [r for r in results 
-                       if r['noise_level'] == noise_level 
+            # Filter results for this noise level and config (aggregate across scans/runs)
+            filtered = [r for r in results
+                       if r['noise_level'] == noise_level
                        and r['config_name'] == config_name]
             
             if filtered:
@@ -374,17 +381,24 @@ def main():
     )
     
     parser.add_argument(
-        "--lidar",
+        "--scan-dir",
         type=str,
-        default="../example_data/mcd-data/data/0000000011.bin",
-        help="Path to LiDAR point cloud (.bin)"
+        default="../example_data/mcd-data/data",
+        help="Directory of LiDAR point clouds (.bin)"
     )
     
     parser.add_argument(
-        "--gt-labels",
+        "--gt-dir",
         type=str,
-        default="../example_data/mcd-data/labels_groundtruth/0000000011.bin",
-        help="Path to ground truth labels"
+        default="../example_data/mcd-data/labels_groundtruth",
+        help="Directory of ground truth labels"
+    )
+    
+    parser.add_argument(
+        "--max-scans",
+        type=int,
+        default=None,
+        help="Max scans to process (default: all)"
     )
     
     parser.add_argument(
@@ -440,21 +454,22 @@ def main():
     
     # Convert relative paths to absolute
     script_dir = Path(__file__).parent
-    lidar_path = (script_dir / args.lidar).resolve()
-    gt_labels_path = (script_dir / args.gt_labels).resolve()
+    scan_dir = (script_dir / args.scan_dir).resolve()
+    gt_dir = (script_dir / args.gt_dir).resolve()
     osm_path = (script_dir / args.osm).resolve()
     config_path = (script_dir / args.config).resolve()
     
     # Run ablation study
     run_ablation_study(
-        lidar_path=lidar_path,
-        gt_labels_path=gt_labels_path,
+        scan_dir=scan_dir,
+        gt_dir=gt_dir,
         osm_path=osm_path,
         config_path=config_path,
         noise_levels=args.noise_levels,
         output_csv=output_csv,
         num_runs=args.runs,
-        use_kitti=args.kitti_labels
+        use_kitti=args.kitti_labels,
+        max_scans=args.max_scans
     )
 
 
