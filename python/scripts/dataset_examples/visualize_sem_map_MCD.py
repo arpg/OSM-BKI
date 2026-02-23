@@ -14,8 +14,11 @@ from tqdm import tqdm
 
 from utils import read_bin_file
 
+ORIGIN_LATLON = [59.348268650, 18.073204280]
+ORIGIN_REL_POS = [64.3932532565158, 66.4832330946657, 38.5143341050069]
+
 # MCD label config path relative to project root
-DEFAULT_CONFIG_PATH = os.path.join("./python/scripts/dataset_examples/data_cfg_mcd.yaml")
+DEFAULT_CONFIG_PATH = os.path.join("./python/scripts/dataset_examples/labels_mcd.yaml")
 
 # Body to LiDAR transformation matrix
 BODY_TO_LIDAR_TF = np.array([
@@ -24,24 +27,6 @@ BODY_TO_LIDAR_TF = np.array([
     [-0.006634514801117132, 0.02800900135032654, -0.999585653686922, -0.01755515794222565],
     [0.0, 0.0, 0.0, 1.0]
 ])
-
-def read_bin_file(file_path, dtype, shape=None):
-    """
-    Reads a .bin file and reshapes the data according to the provided shape.
-
-    Args:
-        file_path (str): The path to the .bin file.
-        dtype (data-type): The data type of the file content (e.g., np.float32, np.int16).
-        shape (tuple, optional): The desired shape of the output array. If None, the data is returned as a 1D array.
-
-    Returns:
-        np.ndarray: The data read from the .bin file, reshaped according to the provided shape.
-    """
-    data = np.fromfile(file_path, dtype=dtype)
-    if shape:
-        return data.reshape(shape)
-    return data
-
 
 def load_label_config(config_path):
     """
