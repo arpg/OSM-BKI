@@ -39,8 +39,9 @@ If libosmium is not found by CMake, set `OSMIUM_INCLUDE_DIR` when configuring (e
 ## Project structure
 
 ```
-osm_bki/
+cpp/osm_bki/
 ├── CMakeLists.txt
+├── README.md
 ├── include/           # Public headers
 │   ├── continuous_bki.hpp
 │   ├── dataset_utils.hpp
@@ -52,15 +53,16 @@ osm_bki/
 │   ├── continuous_bki.cpp
 │   ├── dataset_utils.cpp
 │   ├── file_io.cpp
+│   ├── osm_loader.cpp
 │   └── osm_parser.cpp
 ├── examples/
-│   └── visualize_map_osm.cpp   # PCL viewer: map + OSM polylines
-└── configs/
-    ├── mcd_config.yaml        # MCD dataset (paths, OSM file, origins)
-    ├── osm_config.yaml       # OSM category filters
-    ├── kitti360_config.yaml
-    └── kitti_config.yaml
+│   ├── visualize_map_osm.cpp   # PCL viewer: map + OSM polylines
+│   ├── test_cbki.cpp          # Continuous mapping example
+│   └── osm_config.yaml        # OSM category filters (for visualize_map_osm)
+└── build/             # CMake build output
 ```
+
+Configs (`mcd_config.yaml`, etc.) and example data live at the **repo root**: `configs/`, `example_data/`. Run from the repo root so paths resolve correctly.
 
 ## Build
 
@@ -107,14 +109,22 @@ The example executable is produced at `build/visualize_map_osm`.
 ./build/visualize_map_osm [mcd_config.yaml] [osm_config.yaml] [skip_frames]
 ```
 
-- **mcd_config.yaml** – Dataset and OSM settings (default: `configs/mcd_config.yaml`).
-- **osm_config.yaml** – OSM category toggles (default: `configs/osm_config.yaml`).
+Defaults assume running from **repo root**: `mcd_config.yaml` → `configs/mcd_config.yaml`. `osm_config.yaml` defaults to `examples/osm_config.yaml` (relative to the executable, i.e. `cpp/osm_bki/examples/`).
+
+- **mcd_config.yaml** – Dataset and OSM settings (default: `configs/mcd_config.yaml`; run from repo root).
+- **osm_config.yaml** – OSM category toggles (default: `examples/osm_config.yaml` next to the executable).
 - **skip_frames** – Optional; overrides `skip_frames` in the MCD config.
 
-**Example:**
+**Example (from repo root):**
 
 ```bash
-./build/visualize_map_osm configs/mcd_config.yaml configs/osm_config.yaml
+./cpp/osm_bki/build/visualize_map_osm configs/mcd_config.yaml
+```
+
+Or from `cpp/osm_bki/`:
+
+```bash
+./build/visualize_map_osm ../configs/mcd_config.yaml
 ```
 
 ### MCD config (mcd_config.yaml)
@@ -123,15 +133,16 @@ Key fields used by the example:
 
 **Path resolution (choose one):**
 - **Direct paths** (relative to config file): `lidar_dir`, `label_dir`, `pose_path`, `calibration_path`, `osm_file`.
-å
+- **Legacy**: `dataset_root_path` + `sequence` – derive paths under `dataset_root_path/sequence/`.
+
 **Other fields:**
 - **init_latlon_day_06** – `[lat, lon]` used as OSM local coordinate origin.
 - **init_rel_pos_day_06** – `[x, y, z]` world origin for aligning poses (subtracted from pose positions).
 - **skip_frames** – Number of frames to skip between scans used for the map.
 
-### OSM config (osm_config.yaml)
+### OSM config (examples/osm_config.yaml)
 
-Boolean flags to include or exclude OSM categories: buildings, roads, sidewalks, parking, fences, stairs, grasslands, trees. Used only when building the example; the core library does not depend on this file.
+Boolean flags to include or exclude OSM categories: buildings, roads, sidewalks, parking, fences, stairs, grasslands, trees. Lives next to `visualize_map_osm.cpp`; the core library does not depend on this file.
 
 ## License
 

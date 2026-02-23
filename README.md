@@ -1,146 +1,147 @@
-# Composite BKI for LiDAR Semantic Segmentation
+# OSM-BKI: Composite BKI for LiDAR Semantic Segmentation
 
 Bayesian Kernel Inference (BKI) for semantic label refinement of LiDAR point clouds using OpenStreetMap (OSM) priors.
 
-This project now features a **Continuous Mapping Engine** (`continuous_bki`) as its core backend, supporting both single-scan refinement and stateful semantic mapping over time.
+This project features a **Continuous Mapping Engine** (`continuous_bki`) as its core backend, supporting both single-scan refinement and stateful semantic mapping over time.
 
--
+---
 
 ## Project Structure
 
 ```
-composite_bki/
-├── src/                        # C++ accelerated package (MAIN)
-│   ├── composite_bki_cpp/      # Core C++ engine (Voxel-based BKI)
-│   ├── cli.py                  # Command-line interface
-│   └── setup.py                # Build & installation
+OSM-BKI/
+├── README.md                 # This file
+├── configs/                  # Dataset configurations
+│   ├── mcd_config.yaml       # MCD (KTH campus) – direct paths or dataset_root_path+sequence
+│   └── kitti*.yaml           # KITTI / KITTI360 configs
 │
-├── configs/                    # Dataset configurations
-│   ├── mcd_config.yaml         # MCD configuration
-│   └── kitti_config.yaml       # SemanticKITTI configuration
+├── example_data/             # Sample data
+│   ├── mcd/                  # MCD format (KTH)
+│   │   ├── kth_day_06/       # LiDAR, labels, poses
+│   │   ├── kth.osm           # OSM map
+│   │   └── hhs_calib.yaml    # Calibration
+│   └── kitti360/             # KITTI360 format
 │
-├── examples/                   # Usage examples
-│   └── basic_usage.py          # Demo script
+├── python/                   # Python package, scripts, benchmarks
+│   ├── README.md             # Python setup & usage
+│   ├── run_osmbki.sh         # Run continuous map on example data
+│   ├── run_benchmarks.sh     # Run all benchmarks
+│   ├── scripts/              # continuous_map_train_test, visualize_osm_xml, bki_tools, etc.
+│   └── benchmarks/           # Throughput, calibration, OSM modes, etc.
 │
-├── benchmarks/                 # Performance benchmarks
-│
-├── scripts/                    # Utility scripts
-│   ├── visualize_osm.py        # Visualize OSM geometries
-│   └── copy_kth_data.py        # Data management
-│
-└── example_data/               # Sample data
+└── cpp/osm_bki/              # C++ library
+    ├── README.md             # C++ build & examples
+    └── src/, include/        # Core engine
 ```
+
+---
 
 ## Quick Start
 
-### Installation
-
-Build and install the Python package from source:
+### 1. Build the Python extension
 
 ```bash
-cd src/
-pip install .
-```
-
-For development (editable install):
-```bash
-cd src/
+cd python
+pip install -r requirements.txt
 pip install -e .
 ```
 
-### Usage
+### 2. Run on example data
 
-The `composite-bki` tool (installed via `pip`) is the main entry point.
-
-#### 1. Single Scan Refinement (Classic Mode)
-Process one scan at a time, treating each independently.
+From the **repo root**:
 
 ```bash
-composite-bki --scan scan.bin --label labels.label --osm map.bin \
-              --config configs/mcd_config.yaml \
-              --output refined.label
+./python/run_osmbki.sh
 ```
 
-#### 2. Continuous Mapping (New!)
-Accumulate semantic evidence over multiple scans into a persistent voxel map.
+Trains a continuous BKI map on `example_data/mcd/kth_day_06` and evaluates on held-out scans. Output: `output.bki`.
+
+### 3. Run benchmarks
 
 ```bash
-# Enable continuous mode with --continuous
-composite-bki --continuous \
-              --scan scan_01.bin --label labels_01.label \
-              --osm map.bin \
-              --config configs/mcd_config.yaml \
-              --output refined_01.label \
-              --save-map my_map.bki
+./python/run_benchmarks.sh
 ```
 
-You can then load the map for subsequent scans:
+---
 
-```bash
-composite-bki --continuous \
-              --load-map my_map.bki \
-              --scan scan_02.bin --label labels_02.label \
-              --osm map.bin \
-              --config configs/mcd_config.yaml \
-              --output refined_02.label \
-              --save-map my_map_updated.bki
-```
+## Configuration
 
-### Python API
+Paths are specified via **direct keys** in the config (relative to the config file) or via **legacy** `dataset_root_path` + `sequence`:
+
+- **Direct paths**: `lidar_dir`, `label_dir`, `pose_path`, `calibration_path`, `osm_file`
+- **Legacy**: `dataset_root_path` + `sequence` – paths derived under `dataset_root_path/sequence/`
+
+See `configs/mcd_config.yaml` and [python/README.md](python/README.md) for details.
+
+---
+
+## Python API
 
 ```python
 import composite_bki_cpp
 import numpy as np
 
-# Initialize BKI Engine
+# Initialize BKI engine
 bki = composite_bki_cpp.PyContinuousBKI(
-    osm_path="map.bin",
+    osm_path="example_data/mcd/kth.osm",
     config_path="configs/mcd_config.yaml",
-    resolution=0.1,  # Voxel size
-    l_scale=3.0      # Spatial kernel scale
+    resolution=0.5,
+    l_scale=1.0
 )
 
-# Load data (Numpy arrays)
+# Load data (numpy arrays)
 points = np.fromfile("scan.bin", dtype=np.float32).reshape(-1, 4)[:, :3]
-labels = np.fromfile("labels.label", dtype=np.uint32)
+labels = np.fromfile("labels.bin", dtype=np.uint32)
 
-# Update the map
+# Update map and infer refined labels
 bki.update(labels, points)
-
-# Infer refined labels
-refined_labels = bki.infer(points)
+refined = bki.infer(points)
 
 # Save map state
-bki.save("global_map.bki")
+bki.save("map.bki")
 ```
+
+---
 
 ## Features
 
-- **Unified Backend**: Single C++ engine (`ContinuousBKI`) handles all operations.
-- **Voxel-based**: Uses sparse voxel hashing for O(1) lookups and memory efficiency.
-- **Stateful**: Can accumulate semantic evidence across thousands of scans.
-- **Fast**: Multi-threaded with OpenMP.
-- **Flexible**: YAML-based configuration for any label format.
+- **Unified backend**: Single C++ engine (`ContinuousBKI`) for all operations
+- **Voxel-based**: Sparse voxel hashing for O(1) lookups
+- **Stateful**: Accumulates semantic evidence across thousands of scans
+- **OSM priors**: XML or binary OSM geometries for roads, buildings, vegetation, etc.
+- **Multi-threaded**: OpenMP support
+
+---
 
 ## Requirements
 
 - Python 3.7+
-- NumPy >= 1.19.0
-- Cython >= 0.29.0
-- g++ with OpenMP support
+- NumPy, pybind11, PyYAML, Open3D (see `python/requirements.txt`)
+- C++17 compiler with OpenMP
+
+---
+
+## Documentation
+
+- [python/README.md](python/README.md) – Python setup, scripts, benchmarks
+- [cpp/osm_bki/README.md](cpp/osm_bki/README.md) – C++ build and examples
+
+---
 
 ## Citation
 
 If you use this work, please cite:
 
 ```bibtex
-@software{composite_bki,
-  title={Composite BKI: Bayesian Kernel Inference for LiDAR Semantic Segmentation},
-  author={Composite BKI Team},
+@software{osm_bki,
+  title={OSM-BKI: Bayesian Kernel Inference for LiDAR Semantic Segmentation with OpenStreetMap Priors},
+  author={OSM-BKI Team},
   year={2026},
-  url={https://github.com/yourrepo/composite-bki}
+  url={https://github.com/yourrepo/OSM-BKI}
 }
 ```
+
+---
 
 ## License
 

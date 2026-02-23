@@ -1,4 +1,4 @@
-# OSM parser configuration for osm_bki/examples/visualize_osm.cpp
+# OSM parser configuration for visualize_map_osm
 # Category filters (mirrors BKISemanticMapping osmium filtering intent)
 include_buildings: true
 include_roads: true

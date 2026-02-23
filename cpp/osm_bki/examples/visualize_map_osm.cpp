@@ -83,8 +83,14 @@ std::pair<double, double> transformOSMPointLikeBKI(
 int main(int argc, char** argv) {
     const std::string mcd_config_path =
         (argc > 1) ? argv[1] : "configs/mcd_config.yaml";
-    const std::string osm_config_path =
-        (argc > 2) ? argv[2] : "configs/osm_config.yaml";
+    std::string osm_config_path;
+    if (argc > 2) {
+        osm_config_path = argv[2];
+    } else {
+        // Default: examples/osm_config.yaml next to this executable (build/../examples/)
+        const auto exe_dir = std::filesystem::path(argc > 0 ? argv[0] : "").parent_path();
+        osm_config_path = (exe_dir / ".." / "examples" / "osm_config.yaml").lexically_normal().string();
+    }
 
     continuous_bki::DatasetConfig map_config;
     std::string error_msg;
