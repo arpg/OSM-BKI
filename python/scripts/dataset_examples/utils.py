@@ -121,6 +121,20 @@ def latlon_to_mercator_relative(lat_deg, lon_deg, origin_lat, origin_lon):
     return mx - ox, my - oy
 
 
+def mercator_relative_to_latlon(rel_x, rel_y, origin_lat, origin_lon):
+    """
+    Inverse of latlon_to_mercator_relative: convert relative Mercator (meters)
+    back to lat/lon, given the same origin used in the forward transform.
+    """
+    scale = lat_to_scale(origin_lat)
+    origin_lon_rad = math.radians(origin_lon)
+    origin_lat_rad = math.radians(origin_lat)
+    lon_rad = rel_x / (scale * EARTH_RADIUS_M) + origin_lon_rad
+    log_origin = math.log(math.tan(math.pi / 4 + origin_lat_rad / 2))
+    lat_rad = 2.0 * math.atan(math.exp(rel_y / (scale * EARTH_RADIUS_M) + log_origin)) - math.pi / 2
+    return math.degrees(lat_rad), math.degrees(lon_rad)
+
+
 # ---------------------------------------------------------------------------
 # OSM geometry rendering
 # ---------------------------------------------------------------------------

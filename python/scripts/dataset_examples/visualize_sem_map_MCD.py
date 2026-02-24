@@ -15,8 +15,7 @@ from tqdm import tqdm
 
 from utils import *
 
-ORIGIN_LATLON = [59.348268650, 18.073204280]
-ORIGIN_REL_POS = [64.3932532565158, 66.4832330946657, 38.5143341050069]
+ORIGIN_LATLON = [59.347671416, 18.072069652]  # GPS at world-frame origin (0,0,0)
 
 # MCD label config path relative to project root
 DEFAULT_CONFIG_PATH = os.path.join("./python/scripts/dataset_examples/labels_mcd.yaml")
@@ -685,17 +684,22 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
     pcd.colors = o3d.utility.Vector3dVector(colors)
 
     extra_geoms = []
+    path_xyz = None
+    path_z_default = 0.0
 
-    # -- Drive path -------------------------------------------------------
-    if with_path:
+    # -- Drive path (also used to set OSM z-offset) -----------------------
+    if with_path or with_osm:
         path_xyz = build_path_from_poses(poses_dict, index_to_timestamp)
-        if path_xyz is not None:
-            path_geom = create_path_geometry(path_xyz, color=(0.0, 0.8, 0.0), thickness=path_thickness)
-            if path_geom is not None:
-                extra_geoms.append(path_geom)
-                print(f"Path: {len(path_xyz)} poses")
+        if path_xyz is not None and len(path_xyz) >= 2:
+            path_z_default = float(np.median(path_xyz[:, 2]))
+            if with_path:
+                path_geom = create_path_geometry(path_xyz, color=(0.0, 0.8, 0.0), thickness=path_thickness)
+                if path_geom is not None:
+                    extra_geoms.append(path_geom)
+                    print(f"Path: {len(path_xyz)} poses")
         else:
-            print("Warning: not enough poses for path geometry.", file=sys.stderr)
+            if with_path:
+                print("Warning: not enough poses for path geometry.", file=sys.stderr)
 
     # -- OSM overlay ------------------------------------------------------
     if with_osm:
@@ -703,15 +707,10 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
         if os.path.isfile(osm_file):
             print(f"Loading OSM: {osm_file}")
             loader = OSMLoader(osm_file, origin_latlon=tuple(ORIGIN_LATLON))
-            path_z = float(ORIGIN_REL_POS[2])
             osm_geoms = loader.get_geometries(
-                z_offset=path_z, thickness=osm_thickness, buildings_only=not osm_all,
+                z_offset=path_z_default, thickness=osm_thickness, buildings_only=not osm_all,
             )
             if osm_geoms:
-                trans = np.array([ORIGIN_REL_POS[0], ORIGIN_REL_POS[1], 0.0])
-                for mesh_geom in osm_geoms:
-                    mesh_geom.translate(trans)
-                print(f"OSM: shifted by ORIGIN_REL_POS ({ORIGIN_REL_POS[0]:.1f}, {ORIGIN_REL_POS[1]:.1f}) to align with world frame")
                 extra_geoms.extend(osm_geoms)
                 kind = "building" if not osm_all else "geometry"
                 print(f"OSM: {len(osm_geoms)} {kind} groups")
