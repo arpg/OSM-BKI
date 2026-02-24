@@ -1,2 +1,4 @@
 
 cpp/osm_bki/build/
+
+*__pycache__*
