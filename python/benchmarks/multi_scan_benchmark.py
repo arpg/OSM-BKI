@@ -19,9 +19,9 @@ from pathlib import Path
 from datetime import datetime
 import time
 
-# Add parent directory to path to import composite_bki_cpp
+# Add parent directory to path to import osm_bki_cpp
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-import composite_bki_cpp
+import osm_bki_cpp
 
 # Import benchmark utilities
 from benchmark_utils import (
@@ -94,8 +94,6 @@ def main():
     parser.set_defaults(seed_osm_prior=True)
     parser.add_argument("--osm-prior-strength", type=float, default=0.1)
     parser.add_argument("--disable-osm-fallback", action="store_true")
-    parser.add_argument("--lambda-min", type=float, default=0.0)
-    parser.add_argument("--lambda-max", type=float, default=0.0)
     
     # Benchmark Options
     parser.add_argument("--checkpoints", type=int, nargs="+", default=[1, 5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100], help="Scan counts to evaluate at")
@@ -165,7 +163,7 @@ def main():
             
     # Initialize BKI
     print("Initializing BKI...")
-    bki = composite_bki_cpp.PyContinuousBKI(
+    bki = osm_bki_cpp.PyContinuousBKI(
         osm_path=str(osm_path),
         config_path=str(config_path),
         resolution=args.resolution,
@@ -179,9 +177,7 @@ def main():
         alpha0=args.alpha0,
         seed_osm_prior=args.seed_osm_prior,
         osm_prior_strength=args.osm_prior_strength,
-        osm_fallback_in_infer=not args.disable_osm_fallback,
-        lambda_min=args.lambda_min,
-        lambda_max=args.lambda_max
+        osm_fallback_in_infer=not args.disable_osm_fallback
     )
     
     # Prepare Output

@@ -5,7 +5,7 @@ Benchmark Composite BKI performance across OSM randomization levels.
 This benchmark:
 1. Randomizes the OSM map at controlled levels (logic in this script)
 2. Runs Composite BKI refinement for each randomized map
-3. Evaluates against ground truth (using composite_bki.py metrics logic)
+3. Evaluates against ground truth (using osm_bki metrics logic)
 4. Outputs results to CSV
 """
 
@@ -13,6 +13,7 @@ import numpy as np
 import sys
 import csv
 import struct
+import yaml
 from pathlib import Path
 from datetime import datetime
 
@@ -20,7 +21,68 @@ from datetime import datetime
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-import composite_bki_cpp
+import osm_bki_cpp
+
+# Category mapping: load_osm_geometries returns by class (config osm_class_map order)
+_CLASS_TO_CATEGORY = {
+    0: "roads",
+    1: "roads",   # parking -> merge into roads
+    2: "roads",   # sidewalks -> merge into roads
+    3: "grasslands",  # vegetation: grasslands, trees, wood
+    4: "buildings",
+    5: "grasslands",  # fences -> merge into grasslands
+}
+
+
+def _extract_polygons_from_geometries(points, lines):
+    """Extract polygons from load_osm_geometries output (points + line indices)."""
+    if not points or not lines:
+        return []
+    pts = np.array(points)[:, :2]  # drop z
+    n_pts = len(pts)
+    # Build next[i] = j for each line (i,j)
+    next_idx = {}
+    for (i, j) in lines:
+        i, j = int(i), int(j)
+        if 0 <= i < n_pts and 0 <= j < n_pts:
+            next_idx[i] = j
+    polygons = []
+    visited = set()
+    for start in range(n_pts):
+        if start in visited:
+            continue
+        cycle = []
+        cur = start
+        while cur is not None and cur not in visited:
+            visited.add(cur)
+            cycle.append(cur)
+            cur = next_idx.get(cur)
+        if cycle and next_idx.get(cycle[-1]) == start:
+            poly = [(float(pts[i, 0]), float(pts[i, 1])) for i in cycle]
+            if len(poly) >= 3:
+                polygons.append(poly)
+    return polygons
+
+
+def load_osm_from_xml(osm_path, config_path):
+    """
+    Load OSM geometries from .osm XML file via C++ loader.
+    Returns dict: category -> list of polygon coords [(x,y), ...].
+    """
+    data = osm_bki_cpp.load_osm_geometries(str(osm_path), str(config_path), z_offset=0.0)
+    result = {cat: [] for cat in ["buildings", "roads", "grasslands", "trees", "wood"]}
+    for idx, geom in enumerate(data):
+        cat = _CLASS_TO_CATEGORY.get(idx, "grasslands")
+        if cat not in result:
+            continue
+        pts = geom["points"]
+        lines = geom["lines"]
+        polys = _extract_polygons_from_geometries(pts, lines)
+        if cat == "grasslands":
+            result["grasslands"].extend(polys)
+        else:
+            result[cat].extend(polys)
+    return result
 
 
 def load_osm_bin(bin_file):
@@ -66,15 +128,26 @@ def load_osm_bin(bin_file):
     return data
 
 
-def save_osm_bin(data, output_file):
+def _get_osm_categories(config_path):
+    """Load osm_categories from config YAML (order required by C++ loader)."""
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    return cfg.get("osm_categories", ["buildings", "roads", "grasslands", "trees", "wood"])
+
+
+def save_osm_bin(data, output_file, config_path=None):
     """
-    Save OSM geometries to binary file.
+    Save OSM geometries to binary file (format compatible with C++ loadOSMBinary).
     
     Args:
         data: Dictionary with categories and polygon coordinates
         output_file: Path to output .bin file
+        config_path: Optional config path for osm_categories order
     """
-    categories = ["buildings", "roads", "grasslands", "trees", "wood"]
+    if config_path and Path(config_path).exists():
+        categories = _get_osm_categories(config_path)
+    else:
+        categories = ["buildings", "roads", "grasslands", "trees", "wood"]
     
     with open(output_file, "wb") as f:
         for cat in categories:
@@ -335,6 +408,7 @@ def print_statistics(data, title="OSM Statistics"):
 def randomize_osm(
     input_file,
     output_file,
+    config_path=None,
     noise_level=0.0,
     noise_std=1.0,
     removal_rate=0.0,
@@ -349,8 +423,9 @@ def randomize_osm(
     Apply multiple randomization techniques to OSM data.
     
     Args:
-        input_file: Input OSM .bin file
+        input_file: Input OSM file (.osm XML or .bin)
         output_file: Output OSM .bin file
+        config_path: Config YAML (required for .osm input)
         noise_level: Probability of adding noise to coordinates (0.0-1.0)
         noise_std: Standard deviation of coordinate noise in meters
         removal_rate: Probability of removing entire geometries (0.0-1.0)
@@ -365,8 +440,14 @@ def randomize_osm(
         np.random.seed(seed)
         print(f"Random seed: {seed}")
     
+    input_path = Path(input_file)
     print(f"Loading OSM data from {input_file}...")
-    data = load_osm_bin(input_file)
+    if input_path.suffix.lower() == ".osm":
+        if not config_path:
+            raise ValueError("config_path required when loading .osm file")
+        data = load_osm_from_xml(input_file, config_path)
+    else:
+        data = load_osm_bin(input_file)
     
     print_statistics(data, "Original OSM Data")
     
@@ -397,7 +478,7 @@ def randomize_osm(
     
     # Save output
     print(f"\nSaving to {output_file}...")
-    save_osm_bin(data, output_file)
+    save_osm_bin(data, output_file, config_path)
     
     return data
 
@@ -416,7 +497,7 @@ def check_files_exist(file_dict):
 
 def calculate_metrics(pred_labels, gt_labels):
     """
-    Calculate accuracy and mIoU (matches composite_bki.py::compute_metrics exactly).
+    Calculate accuracy and mIoU (matches osm_bki::compute_metrics exactly).
     """
     intersection = {}
     union = {}
@@ -506,7 +587,7 @@ def run_single_benchmark(
     metrics_before = calculate_metrics(labels, gt_labels)
 
     # Using PyContinuousBKI directly
-    bki = composite_bki_cpp.PyContinuousBKI(
+    bki = osm_bki_cpp.PyContinuousBKI(
         osm_path=str(osm_path),
         config_path=str(config_path),
         resolution=1,
@@ -620,6 +701,7 @@ def run_benchmark(
             randomize_osm(
                 input_file=osm_path,
                 output_file=randomized_osm_path,
+                config_path=config_path,
                 noise_level=params["noise_level"],
                 noise_std=params["noise_std"],
                 removal_rate=params["removal_rate"],
@@ -772,8 +854,8 @@ def main():
     parser.add_argument(
         "--osm",
         type=str,
-        default="../example_data/mcd-data/kth_day_06_osm_geometries.bin",
-        help="Path to OSM geometries",
+        default="../../example_data/kth.osm",
+        help="Path to OSM file (.osm XML or .bin)",
     )
 
     parser.add_argument(

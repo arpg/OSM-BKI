@@ -32,19 +32,20 @@ bool loadDatasetConfig(const std::string& config_path, DatasetConfig& config, st
         yaml_parser::YAMLNode yaml;
         yaml.parseFile(config_path);
 
-        auto root_it = yaml.scalars.find("dataset_root_path");
-        auto seq_it = yaml.scalars.find("sequence");
-        if (root_it == yaml.scalars.end() || seq_it == yaml.scalars.end()) {
-            error_msg = "Missing required keys: dataset_root_path and/or sequence in config.";
-            return false;
-        }
+        const std::filesystem::path config_dir =
+            std::filesystem::path(config_path).parent_path();
 
         auto dataset_it = yaml.scalars.find("dataset_name");
         config.dataset_name = (dataset_it != yaml.scalars.end())
                                   ? stripQuotes(dataset_it->second)
                                   : "mcd";
-        config.dataset_root_path = stripQuotes(root_it->second);
-        config.sequence = stripQuotes(seq_it->second);
+        auto root_it = yaml.scalars.find("dataset_root_path");
+        auto seq_it = yaml.scalars.find("sequence");
+        if (root_it != yaml.scalars.end() && seq_it != yaml.scalars.end()) {
+            config.dataset_root_path = stripQuotes(root_it->second);
+            config.sequence = stripQuotes(seq_it->second);
+        }
+
         auto skip_it = yaml.scalars.find("skip_frames");
         config.skip_frames = (skip_it != yaml.scalars.end()) ? std::max(0, std::stoi(stripQuotes(skip_it->second))) : 0;
 
@@ -85,19 +86,38 @@ bool loadDatasetConfig(const std::string& config_path, DatasetConfig& config, st
             }
         }
 
-        std::string dataset_name_lower = config.dataset_name;
-        std::transform(dataset_name_lower.begin(), dataset_name_lower.end(), dataset_name_lower.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        // Path resolution: either dataset_root_path+sequence (legacy) or direct path keys
+        auto lidar_it = yaml.scalars.find("lidar_dir");
+        auto label_it = yaml.scalars.find("label_dir");
+        auto pose_it = yaml.scalars.find("pose_path");
+        auto calib_it = yaml.scalars.find("calibration_path");
 
-        if (dataset_name_lower == "mcd") {
-            const std::filesystem::path base =
-                std::filesystem::path(config.dataset_root_path) / config.sequence;
-            config.lidar_dir = (base / "lidar_bin" / "data").string();
-            config.label_dir = (base / "gt_labels").string();
-            config.pose_path = (base / "pose_inW.csv").string();
-            config.calibration_path = (std::filesystem::path(config.dataset_root_path) / "hhs_calib.yaml").string();
+        if (lidar_it != yaml.scalars.end() && label_it != yaml.scalars.end() &&
+            pose_it != yaml.scalars.end() && calib_it != yaml.scalars.end()) {
+            // Direct paths (relative to config file)
+            config.lidar_dir = (config_dir / stripQuotes(lidar_it->second)).lexically_normal().string();
+            config.label_dir = (config_dir / stripQuotes(label_it->second)).lexically_normal().string();
+            config.pose_path = (config_dir / stripQuotes(pose_it->second)).lexically_normal().string();
+            config.calibration_path = (config_dir / stripQuotes(calib_it->second)).lexically_normal().string();
+        } else if (!config.dataset_root_path.empty() && !config.sequence.empty()) {
+            // Legacy: derive from dataset_root_path + sequence
+            std::string dataset_name_lower = config.dataset_name;
+            std::transform(dataset_name_lower.begin(), dataset_name_lower.end(), dataset_name_lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (dataset_name_lower == "mcd") {
+                const std::filesystem::path base =
+                    std::filesystem::path(config.dataset_root_path) / config.sequence;
+                config.lidar_dir = (base / "lidar_bin" / "data").string();
+                config.label_dir = (base / "gt_labels").string();
+                config.pose_path = (base / "pose_inW.csv").string();
+                config.calibration_path = (std::filesystem::path(config.dataset_root_path) / "hhs_calib.yaml").string();
+            } else {
+                error_msg = "Unsupported dataset_name: " + config.dataset_name + ". Currently supported: mcd";
+                return false;
+            }
         } else {
-            error_msg = "Unsupported dataset_name: " + config.dataset_name + ". Currently supported: mcd";
+            error_msg = "Config must have either (dataset_root_path and sequence) or "
+                       "(lidar_dir, label_dir, pose_path, calibration_path).";
             return false;
         }
 

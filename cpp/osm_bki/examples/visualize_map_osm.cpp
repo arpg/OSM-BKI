@@ -5,7 +5,7 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
-#include <unordered_map>
+#include "ankerl/unordered_dense.h"
 #include <vector>
 
 #include <Eigen/Dense>
@@ -83,8 +83,14 @@ std::pair<double, double> transformOSMPointLikeBKI(
 int main(int argc, char** argv) {
     const std::string mcd_config_path =
         (argc > 1) ? argv[1] : "configs/mcd_config.yaml";
-    const std::string osm_config_path =
-        (argc > 2) ? argv[2] : "configs/osm_config.yaml";
+    std::string osm_config_path;
+    if (argc > 2) {
+        osm_config_path = argv[2];
+    } else {
+        // Default: examples/osm_config.yaml next to this executable (build/../examples/)
+        const auto exe_dir = std::filesystem::path(argc > 0 ? argv[0] : "").parent_path();
+        osm_config_path = (exe_dir / ".." / "examples" / "osm_config.yaml").lexically_normal().string();
+    }
 
     continuous_bki::DatasetConfig map_config;
     std::string error_msg;
@@ -128,7 +134,7 @@ int main(int argc, char** argv) {
         init_rel_pos(2) = map_config.init_rel_pos_z;
     }
 
-    std::unordered_map<int, Eigen::Matrix4d> lidar_to_map_by_scan_id;
+    ankerl::unordered_dense::map<int, Eigen::Matrix4d> lidar_to_map_by_scan_id;
     lidar_to_map_by_scan_id.reserve(poses.size());
 
     for (const auto& pose : poses) {
@@ -202,9 +208,14 @@ int main(int argc, char** argv) {
         std::cerr << "OSM config error: " << error_msg << std::endl;
         return 1;
     }
-    // Use OSM path and origin from MCD config when present (osm_file is relative to dataset_root_path).
+    // Resolve OSM path: relative to dataset_root_path (legacy) or config file directory
     if (!map_config.osm_file.empty()) {
-        osm_config.osm_file = (std::filesystem::path(map_config.dataset_root_path) / map_config.osm_file).string();
+        if (!map_config.dataset_root_path.empty()) {
+            osm_config.osm_file = (std::filesystem::path(map_config.dataset_root_path) / map_config.osm_file).string();
+        } else {
+            const auto config_dir = std::filesystem::path(mcd_config_path).parent_path();
+            osm_config.osm_file = (config_dir / map_config.osm_file).lexically_normal().string();
+        }
     }
     if (map_config.use_osm_origin_from_mcd) {
         osm_config.use_origin_override = true;

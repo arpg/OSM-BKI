@@ -50,11 +50,13 @@ struct MercatorProjection {
     }
 };
 
-// Simple flat-earth projection (fallback when no GPS origin is configured)
-inline std::pair<double, double> latlon_to_meters(double lat, double lon, double origin_lat, double origin_lon) {
-    double x = deg_to_rad(lon - origin_lon) * std::cos(deg_to_rad(origin_lat)) * EARTH_RADIUS;
-    double y = deg_to_rad(lat - origin_lat) * EARTH_RADIUS;
-    return {x, y};
+// Scaled Mercator projection (matches KITTI / MCD pipeline and visualize_osm_xml.py)
+inline std::pair<double, double> latlon_to_mercator(double lat, double lon,
+                                                    double origin_lat, double origin_lon,
+                                                    double world_offset_x = 0.0, double world_offset_y = 0.0) {
+    MercatorProjection proj;
+    proj.setOrigin(origin_lat, origin_lon, world_offset_x, world_offset_y);
+    return proj.toWorld(lat, lon);
 }
 
 inline std::string trim(const std::string& str) {

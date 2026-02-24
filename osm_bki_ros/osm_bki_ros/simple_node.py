@@ -6,28 +6,28 @@ import numpy as np
 import sys
 import os
 
-# Try to import composite_bki_cpp
+# Try to import osm_bki_cpp
 # If it's not in the path, we can try to find it relative to this file if needed,
 # but usually it's better to rely on PYTHONPATH.
 try:
-    import composite_bki_cpp
+    import osm_bki_cpp
 except ImportError:
     # Fallback: try to add the parent directory's src to path if running from source
-    # This assumes the structure: composite_bki/ros_example/composite_bki_ros/simple_node.py
-    # and composite_bki/src/composite_bki_cpp.so exists
+    # This assumes the structure: OSM-BKI/osm_bki_ros/osm_bki_ros/simple_node.py
+    # and OSM-BKI/python build produces osm_bki_cpp extension
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    # Go up 3 levels: composite_bki_ros -> ros_example -> composite_bki
+    # Go up 3 levels: osm_bki_ros -> osm_bki_ros -> OSM-BKI
     project_root = os.path.abspath(os.path.join(current_dir, '..', '..', '..'))
     src_path = os.path.join(project_root, 'src')
     if os.path.exists(src_path):
         sys.path.append(src_path)
         try:
-            import composite_bki_cpp
+            import osm_bki_cpp
         except ImportError:
-            print("Error: Could not import composite_bki_cpp. Please ensure it is in your PYTHONPATH.")
+            print("Error: Could not import osm_bki_cpp. Please ensure it is in your PYTHONPATH.")
             sys.exit(1)
     else:
-        print("Error: Could not import composite_bki_cpp. Please ensure it is in your PYTHONPATH.")
+        print("Error: Could not import osm_bki_cpp. Please ensure it is in your PYTHONPATH.")
         sys.exit(1)
 
 class SimpleBKINode(Node):
@@ -54,7 +54,7 @@ class SimpleBKINode(Node):
         # Initialize BKI
         self.get_logger().info(f"Initializing BKI with OSM: {osm_path}")
         try:
-            self.bki = composite_bki_cpp.PyContinuousBKI(
+            self.bki = osm_bki_cpp.PyContinuousBKI(
                 osm_path=osm_path,
                 config_path=config_path,
                 resolution=res,

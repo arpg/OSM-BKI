@@ -1,7 +1,7 @@
 /**
  * Continuous mapping example (C++).
  *
- * Mirrors OSM-S-BKI/python/scripts/continuous_mapping_example.py:
+ * Mirrors OSM-BKI/python/scripts/continuous_mapping_example.py:
  * - Loads scans and labels from directories
  * - Initializes BKI with OSM prior (binary or XML)
  * - Updates map with each scan; optionally infers and saves refined labels
@@ -49,7 +49,7 @@ void parseArgs(int argc, char** argv,
                std::string& scan_dir, std::string& label_dir,
                std::string& output_dir, std::string& map_state,
                bool& no_viz,
-               float& osm_prior_strength, float& lambda_min, float& lambda_max) {
+               float& osm_prior_strength) {
     config_path = "configs/mcd_config.yaml";
     osm_path.clear();
     scan_dir.clear();
@@ -58,8 +58,6 @@ void parseArgs(int argc, char** argv,
     map_state.clear();
     no_viz = false;
     osm_prior_strength = 0.0f;
-    lambda_min = 0.8f;
-    lambda_max = 0.99f;
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -75,8 +73,6 @@ void parseArgs(int argc, char** argv,
         else if (std::strcmp(arg, "--map-state") == 0 && next()) map_state = argv[i];
         else if (std::strcmp(arg, "--no-viz") == 0) no_viz = true;
         else if (std::strcmp(arg, "--osm-prior-strength") == 0 && next()) osm_prior_strength = std::stof(argv[i]);
-        else if (std::strcmp(arg, "--lambda-min") == 0 && next()) lambda_min = std::stof(argv[i]);
-        else if (std::strcmp(arg, "--lambda-max") == 0 && next()) lambda_max = std::stof(argv[i]);
     }
 }
 
@@ -85,30 +81,35 @@ void parseArgs(int argc, char** argv,
 int main(int argc, char** argv) {
     std::string config_path, osm_path, scan_dir, label_dir, output_dir, map_state;
     bool no_viz;
-    float osm_prior_strength, lambda_min, lambda_max;
+    float osm_prior_strength;
     parseArgs(argc, argv, config_path, osm_path, scan_dir, label_dir,
-              output_dir, map_state, no_viz, osm_prior_strength, lambda_min, lambda_max);
+              output_dir, map_state, no_viz, osm_prior_strength);
 
-    // If paths not given, derive from mcd_config.yaml (dataset_root_path, sequence, osm_file).
+    // If paths not given, try loading from config (direct paths or dataset_root_path+sequence).
     if (osm_path.empty() || scan_dir.empty() || label_dir.empty()) {
         continuous_bki::DatasetConfig dataset_config;
         std::string err;
         if (!continuous_bki::loadDatasetConfig(config_path, dataset_config, err)) {
             std::cerr << "Failed to load dataset config from " << config_path << ": " << err << std::endl;
-            std::cerr << "Paths can be set in config or overridden with --osm, --scan-dir, --label-dir.\n";
+            std::cerr << "Paths can be set in config (lidar_dir, label_dir, osm_file) or via --osm, --scan-dir, --label-dir.\n";
             return 1;
         }
         if (scan_dir.empty()) scan_dir = dataset_config.lidar_dir;
         if (label_dir.empty()) label_dir = dataset_config.label_dir;
         if (osm_path.empty() && !dataset_config.osm_file.empty()) {
-            osm_path = (fs::path(dataset_config.dataset_root_path) / dataset_config.osm_file).string();
+            if (!dataset_config.dataset_root_path.empty()) {
+                osm_path = (fs::path(dataset_config.dataset_root_path) / dataset_config.osm_file).string();
+            } else {
+                const auto config_dir = fs::path(config_path).parent_path();
+                osm_path = (config_dir / dataset_config.osm_file).lexically_normal().string();
+            }
         }
     }
 
     if (osm_path.empty() || scan_dir.empty() || label_dir.empty()) {
         std::cerr << "Usage: " << (argc ? argv[0] : "test_cbki")
-                  << " [--config <yaml>] [--osm <path>] [--scan-dir <dir>] [--label-dir <dir>] [--output-dir <dir>] [--map-state <file>] [--no-viz] [--osm-prior-strength <f>] [--lambda-min <f>] [--lambda-max <f>]\n"
-                  << "Defaults: config=configs/mcd_config.yaml; osm/scan-dir/label-dir are read from that config (dataset_root_path, sequence, osm_file).\n";
+                  << " [--config <yaml>] [--osm <path>] [--scan-dir <dir>] [--label-dir <dir>] [--output-dir <dir>] [--map-state <file>] [--no-viz] [--osm-prior-strength <f>]\n"
+                  << "Paths from config (lidar_dir, label_dir, osm_file) or via CLI.\n";
         return 1;
     }
 
@@ -149,8 +150,7 @@ int main(int argc, char** argv) {
         1.0f,              // alpha0
         true,              // seed_osm_prior
         osm_prior_strength,
-        true,              // osm_fallback_in_infer
-        lambda_min, lambda_max);
+        true);             // osm_fallback_in_infer
 
     std::cout << "BKI initialized with " << bki.size() << " voxels" << std::endl;
     

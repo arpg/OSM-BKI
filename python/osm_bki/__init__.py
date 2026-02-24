@@ -1,5 +1,5 @@
 """
-Composite BKI - Fast Semantic-Spatial Bayesian Kernel Inference for LiDAR
+OSM-BKI - Fast Semantic-Spatial Bayesian Kernel Inference for LiDAR
 
 A high-performance C++ implementation with Python bindings for semantic
 segmentation refinement of LiDAR point clouds using OpenStreetMap priors.
@@ -11,34 +11,33 @@ Features:
 - Optional GPU acceleration (CUDA)
 
 Example:
-    >>> import composite_bki_cpp
-    >>> refined = composite_bki_cpp.run_pipeline(
-    ...     lidar_path="scan.bin",
-    ...     label_path="labels.label",
+    >>> import osm_bki_cpp
+    >>> bki = osm_bki_cpp.PyContinuousBKI(
     ...     osm_path="osm_map.bin",
-    ...     config_path="configs/mcd_config.yaml",
-    ...     output_path="refined.label"
+    ...     config_path="configs/mcd_config.yaml"
     ... )
+    >>> bki.update(labels, points)
+    >>> refined = bki.infer(points)
 
 Command-line usage:
-    $ composite-bki --scan scan.bin --label labels.label --osm map.bin --output refined.label
+    $ osm-bki --scan scan.bin --label labels.label --osm map.bin --output refined.label
 """
 
 __version__ = "2.0.0"
-__author__ = "Composite BKI Team"
+__author__ = "OSM-BKI Team"
 __license__ = "MIT"
 
 # Import the Cython extension when the package is imported
 try:
-    import composite_bki_cpp
-    from composite_bki_cpp import (
-        PySemanticBKI,
-        run_pipeline
+    import osm_bki_cpp
+    from osm_bki_cpp import (
+        PyContinuousBKI,
+        latlon_to_mercator
     )
     
     __all__ = [
-        'PySemanticBKI',
-        'run_pipeline',
+        'PyContinuousBKI',
+        'latlon_to_mercator',
         '__version__',
     ]
     
@@ -61,7 +60,7 @@ def get_version():
 
 def print_info():
     """Print package information."""
-    print(f"Composite BKI C++ v{__version__}")
+    print(f"OSM-BKI C++ v{__version__}")
     print("High-performance semantic segmentation for LiDAR point clouds")
     print("\nFeatures:")
     print("  - Multi-threaded CPU processing (OpenMP)")
@@ -69,5 +68,5 @@ def print_info():
     print("  - MCD and SemanticKITTI label formats")
     print("  - 8-15x faster than Python implementation")
     print("\nUsage:")
-    print("  Library: import composite_bki_cpp")
-    print("  CLI:     composite-bki --help")
+    print("  Library: import osm_bki_cpp")
+    print("  CLI:     osm-bki --help")

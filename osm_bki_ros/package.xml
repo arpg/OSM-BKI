@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>composite_bki_ros</name>
+  <name>osm_bki_ros</name>
   <version>0.0.1</version>
-  <description>ROS2 node for Composite BKI Semantic Mapping</description>
+  <description>ROS2 node for OSM-BKI Semantic Mapping</description>
   <maintainer email="user@example.com">User</maintainer>
   <license>MIT</license>
 
