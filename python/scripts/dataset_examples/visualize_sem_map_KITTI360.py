@@ -30,6 +30,7 @@ from scipy.stats import rankdata, spearmanr
 import matplotlib.pyplot as plt
 
 from utils import *
+from label_mappings import build_to_common_lut, apply_common_lut, common_labels_to_colors
 
 # Default paths
 KITTI360_ROOT = "./example_data/kitti360"
@@ -317,6 +318,7 @@ def find_frame_range(label_dir):
 def build_semantic_map(
     kitti360_root,
     sequence_index=0,
+    gt_common_lut=None,
     scan_skip=1,
     voxel_size=0.15,
     max_range=None,
@@ -387,7 +389,10 @@ def build_semantic_map(
             world_xyz = world_xyz[mask]
             labels = labels[mask]
 
-        colors = labels_to_colors(labels)
+        if gt_common_lut is not None:
+            colors = common_labels_to_colors(apply_common_lut(labels, gt_common_lut))
+        else:
+            colors = labels_to_colors(labels)
 
         if voxel_size is not None and voxel_size > 0:
             pcd = o3d.geometry.PointCloud()
@@ -419,8 +424,9 @@ def build_multiclass_map(
     kitti360_root,
     sequence_index=0,
     labels_key="kitti360",
-    learning_map=None,
     learning_map_inv=None,
+    gt_common_lut=None,
+    inf_common_lut=None,
     scan_skip=1,
     voxel_size=0.15,
     max_range=None,
@@ -429,8 +435,10 @@ def build_multiclass_map(
 ):
     """
     Load scans, GT labels, and multiclass confidence scores for one sequence.
-    Returns dict with gt_points, gt_labels, inf_labels, inf_labels_second,
-    inf_variance, and optionally inf_uncertainty arrays for accuracy analysis.
+    GT labels are mapped to common taxonomy via gt_common_lut (KITTI360 raw IDs).
+    Inferred labels are mapped via learning_map_inv then inf_common_lut.
+    Returns dict with points, gt_labels, inf_labels, inf_labels_second (all in
+    common taxonomy IDs), inf_variance, and optionally inf_uncertainty.
     """
     seq_dir = f"2013_05_28_drive_{sequence_index:04d}_sync"
     paths = get_sequence_paths(kitti360_root, sequence_index)
@@ -503,19 +511,16 @@ def build_multiclass_map(
             print(f"  Skip frame {frame_id}: {e}", file=sys.stderr)
             continue
 
-        # Map GT to class indices for fair comparison
-        if learning_map is not None:
-            gt_class = map_labels_to_class_indices(gt_lbl, learning_map)
-        else:
-            gt_class = gt_lbl
+        # Map GT raw labels directly to common taxonomy
+        gt_lbl_mapped = apply_common_lut(gt_lbl, gt_common_lut) if gt_common_lut is not None else gt_lbl
 
+        # Map inferred class indices to label IDs, then to common taxonomy
         class_indices = np.argmax(multiclass_probs, axis=1)
-        inf_lbl = map_class_indices_to_labels(class_indices, learning_map_inv) if learning_map_inv else class_indices
+        inf_lbl_raw = map_class_indices_to_labels(class_indices, learning_map_inv) if learning_map_inv else class_indices
+        inf_lbl = apply_common_lut(inf_lbl_raw, inf_common_lut) if inf_common_lut is not None else inf_lbl_raw
         second_class_indices = np.argsort(multiclass_probs, axis=1)[:, -2]
-        inf_lbl_second = map_class_indices_to_labels(second_class_indices, learning_map_inv) if learning_map_inv else second_class_indices
-
-        # Map GT back to label IDs too (via learning_map_inv of the mapped class indices)
-        gt_lbl_mapped = map_class_indices_to_labels(gt_class, learning_map_inv) if learning_map_inv else gt_class
+        inf_lbl_second_raw = map_class_indices_to_labels(second_class_indices, learning_map_inv) if learning_map_inv else second_class_indices
+        inf_lbl_second = apply_common_lut(inf_lbl_second_raw, inf_common_lut) if inf_common_lut is not None else inf_lbl_second_raw
 
         variances = np.var(multiclass_probs.astype(np.float32), axis=1)
         if view_variance:
@@ -794,9 +799,9 @@ def main():
 
     voxel_size = args.downsample if args.downsample > 0 else None
 
-    # Use selected label set for id -> color mapping
-    global LABEL_ID_TO_COLOR
-    LABEL_ID_TO_COLOR = get_label_id_to_color(LABELS_OPTIONS[args.labels])
+    # Build common taxonomy LUTs
+    gt_common_lut = build_to_common_lut("kitti360")
+    inf_common_lut = build_to_common_lut(args.labels)
 
     print(f"KITTI360 root: {args.root}")
     print(f"Sequence index: {args.sequence}")
@@ -853,8 +858,9 @@ def main():
             args.root,
             sequence_index=args.sequence,
             labels_key=args.labels,
-            learning_map=label_cfg["learning_map"],
             learning_map_inv=label_cfg["learning_map_inv"],
+            gt_common_lut=gt_common_lut,
+            inf_common_lut=inf_common_lut,
             scan_skip=args.scan_skip,
             voxel_size=voxel_size,
             max_range=args.max_range,
@@ -887,11 +893,11 @@ def main():
 
         pts = points[mask]
 
-        # Color by variance or by semantic class
+        # Color by variance or by common taxonomy class
         if args.variance and inf_uncertainty is not None:
             colors = scalar_to_viridis_rgb(inf_uncertainty[mask], normalize_range=False)
         else:
-            colors = labels_to_colors(inf_labels[mask])
+            colors = common_labels_to_colors(inf_labels[mask])
 
         if first_pose_for_osm is not None and (args.with_osm or args.with_path):
             pts = pts - first_pose_for_osm.astype(pts.dtype)
@@ -909,11 +915,12 @@ def main():
             print(f"Saved to {args.save}")
 
     else:
-        # Default: one-hot label mode (original behavior)
+        # Default: one-hot label mode
         print("Building semantic map...")
         points, colors = build_semantic_map(
             args.root,
             sequence_index=args.sequence,
+            gt_common_lut=gt_common_lut,
             scan_skip=args.scan_skip,
             voxel_size=voxel_size,
             max_range=args.max_range,

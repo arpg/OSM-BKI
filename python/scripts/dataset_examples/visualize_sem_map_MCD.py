@@ -14,6 +14,7 @@ import yaml
 from tqdm import tqdm
 
 from utils import *
+from label_mappings import build_to_common_lut, apply_common_lut, common_labels_to_colors
 
 ORIGIN_LATLON = [59.347671416, 18.072069652]  # GPS at world-frame origin (0,0,0)
 
@@ -435,10 +436,10 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
     timestamps_file = os.path.join(root_path, "lidar_bin/timestamps.txt")
     poses_file = os.path.join(root_path, "pose_inW.csv")
     gt_labels_dir = os.path.join(root_path, "gt_labels")
-    multiclass_dir = os.path.join(root_path, "inferred_labels", "cenet_mcd", "multiclass_confidence_scores")
+    multiclass_dir = os.path.join(root_path, "inferred_labels", "cenet_semkitti", "multiclass_confidence_scores")
 
     learning_map_inv = label_config["learning_map_inv"]
-    label_id_to_color = label_config["color_map_rgb"]
+    common_lut = build_to_common_lut("mcd")
 
     if not os.path.exists(data_dir) or not os.path.exists(poses_file):
         print("ERROR: Data directory or poses file not found.")
@@ -489,18 +490,22 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
         try:
             points = read_bin_file(bin_path, dtype=np.float32, shape=(-1, 4))
             points_xyz = points[:, :3]
-            gt_lbl = read_bin_file(gt_path, dtype=np.int32, shape=(-1))
+            gt_lbl_raw = read_bin_file(gt_path, dtype=np.int32, shape=(-1))
             raw_probs = read_bin_file(multiclass_path, dtype=np.float16)
             n_points = len(points_xyz)
             n_classes = len(raw_probs) // n_points
-            if len(gt_lbl) != n_points or len(raw_probs) != n_points * n_classes:
+            if len(gt_lbl_raw) != n_points or len(raw_probs) != n_points * n_classes:
                 continue
             multiclass_probs = raw_probs.reshape(n_points, n_classes)
+            gt_lbl = apply_common_lut(gt_lbl_raw, common_lut)
             class_indices = np.argmax(multiclass_probs, axis=1)
-            inf_lbl = map_class_indices_to_labels(class_indices, learning_map_inv)
-            # Second-highest class (for "total accuracy after switching" report and --use-second-above-median)
+            inf_lbl = apply_common_lut(
+                map_class_indices_to_labels(class_indices, learning_map_inv), common_lut,
+            )
             second_class_indices = np.argsort(multiclass_probs, axis=1)[:, -2]
-            inf_lbl_second = map_class_indices_to_labels(second_class_indices, learning_map_inv)
+            inf_lbl_second = apply_common_lut(
+                map_class_indices_to_labels(second_class_indices, learning_map_inv), common_lut,
+            )
             # Variance of class probs (always store for average-variance report)
             variances = np.var(multiclass_probs.astype(np.float32), axis=1)
             # Uncertainty for optional variance coloring (yellow=uncertain, dark=confident)
@@ -678,7 +683,7 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
         unc = inf_uncertainty[mask]
         colors = scalar_to_viridis_rgb(unc, normalize_range=False)
     else:
-        colors = labels_to_colors(lbl, label_id_to_color, confidences=None)
+        colors = common_labels_to_colors(lbl)
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
     pcd.colors = o3d.utility.Vector3dVector(colors)
