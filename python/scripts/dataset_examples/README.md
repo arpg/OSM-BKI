@@ -21,6 +21,7 @@ Both scripts share a common set of arguments for consistency:
 | `--max-scans` | none / `10000` | Max number of scans to process |
 | `--inferred-labels` | `semkitti` | Inference label set: `semkitti`, `kitti360`, `mcd` |
 | `--use-multiclass` | off | Enable multiclass mode with accuracy analysis |
+| `--filter-by-confusion` | off | Filter points using confusion matrix precision (see below) |
 | `--variance` | off | Color by uncertainty (Viridis colormap) |
 | `--view` | `all` | Filter: `all`, `correct`, or `incorrect` |
 | `--with-osm` | off | Overlay OSM building/road outlines |
@@ -69,6 +70,13 @@ python python/scripts/dataset_examples/visualize_sem_map_KITTI360.py \
     --use-multiclass --variance --view incorrect
 ```
 
+With confusion-matrix filtering:
+
+```bash
+python python/scripts/dataset_examples/visualize_sem_map_KITTI360.py \
+    --use-multiclass --filter-by-confusion
+```
+
 ### MCD
 
 One-hot GT labels (default):
@@ -97,6 +105,34 @@ Custom dataset path and sequence:
 python python/scripts/dataset_examples/visualize_sem_map_MCD.py \
     --dataset-path /path/to/mcd --seq kth_day_09 kth_day_10
 ```
+
+With confusion-matrix filtering:
+
+```bash
+python python/scripts/dataset_examples/visualize_sem_map_MCD.py \
+    --use-multiclass --filter-by-confusion
+```
+
+## Confusion Matrix Filtering
+
+When `--use-multiclass` is enabled, the scripts compute accuracy analysis
+including per-uncertainty-bin accuracy, Spearman correlation, and AUROC.
+
+The `--filter-by-confusion` flag adds a confusion-matrix-driven filtering step
+that adapts to each predicted class individually. It works as follows:
+
+1. A confusion matrix (predicted x true) is built over all valid points in the
+   common taxonomy.
+2. For each predicted class, the **precision** is computed: the fraction of
+   predictions for that class that are correct.
+3. The precision is used as a percentile threshold on uncertainty. For a class
+   with 80% precision, the 80% most confident predictions are kept and the 20%
+   most uncertain are dropped.
+
+This means high-precision classes (e.g. road at 98%) lose almost no points,
+while low-precision classes (e.g. other-object at 45%) are aggressively pruned.
+The approach requires no tuning parameters -- the confusion matrix itself
+determines how much to trust each class.
 
 ## Label Configurations
 
@@ -138,3 +174,4 @@ point clouds.
 - Drive path visualization (`create_path_geometry`)
 - Viridis colormap for uncertainty visualization
 - Accuracy / uncertainty analysis (`run_accuracy_analysis`)
+- Confusion-matrix-based point filtering (`filter_by_confusion_matrix`)
