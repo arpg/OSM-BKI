@@ -3,16 +3,37 @@ Shared utilities for KITTI-360 and MCD semantic map visualization scripts.
 """
 
 import math
+import os
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
 import numpy as np
 import open3d as o3d
-import os
+import yaml
 
 # ---------------------------------------------------------------------------
-# Constants
+# Path constants
 # ---------------------------------------------------------------------------
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OSMBKI_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
+
+# ---------------------------------------------------------------------------
+# Dataset constants
+# ---------------------------------------------------------------------------
+INFERRED_LABEL_CONFIGS = {
+    "mcd": os.path.join(_SCRIPT_DIR, "labels_mcd.yaml"),
+    "semkitti": os.path.join(_SCRIPT_DIR, "labels_semkitti.yaml"),
+    "kitti360": os.path.join(_SCRIPT_DIR, "labels_kitti360.yaml"),
+}
+INFERRED_SUBDIRS = {
+    "mcd": "cenet_mcd",
+    "semkitti": "cenet_semkitti",
+    "kitti360": "cenet_kitti360",
+}
+
+KITTI360_ORIGIN_LATLON = (48.9843445, 8.4295857)
+MCD_ORIGIN_LATLON = (59.347671416, 18.072069652)
+
 EARTH_RADIUS_M = 6378137.0
 
 OSM_COLORS = {
@@ -28,6 +49,7 @@ OSM_COLORS = {
 # ---------------------------------------------------------------------------
 # Binary file I/O
 # ---------------------------------------------------------------------------
+
 def read_bin_file(file_path, dtype, shape=None):
     """Read a .bin file and optionally reshape."""
     data = np.fromfile(file_path, dtype=dtype)
@@ -36,25 +58,17 @@ def read_bin_file(file_path, dtype, shape=None):
     return data
 
 # ---------------------------------------------------------------------------
-# Label mapping helpers
+# Label config helpers
 # ---------------------------------------------------------------------------
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-OSMBKI_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
-INFERRED_LABEL_CONFIGS = {
-    "mcd": os.path.join(_SCRIPT_DIR, "labels_mcd.yaml"),
-    "semkitti": os.path.join(_SCRIPT_DIR, "labels_semkitti.yaml"),
-    "kitti360": os.path.join(_SCRIPT_DIR, "labels_kitti360.yaml"),
-}
-INFERRED_SUBDIRS = {
-    "mcd": "cenet_mcd",
-    "semkitti": "cenet_semkitti",
-    "kitti360": "cenet_kitti360",
-}
+def load_label_config(config_path):
+    """Load learning_map and learning_map_inv from a label YAML config."""
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    learning_map = {int(k): int(v) for k, v in cfg.get("learning_map", {}).items()}
+    learning_map_inv = {int(k): int(v) for k, v in cfg.get("learning_map_inv", {}).items()}
+    return {"learning_map": learning_map, "learning_map_inv": learning_map_inv}
 
-# GPS origins (lat, lon) for each dataset's world-frame origin
-KITTI360_ORIGIN_LATLON = (48.9843445, 8.4295857)
-MCD_ORIGIN_LATLON = (59.347671416, 18.072069652)
 
 def map_class_indices_to_labels(class_indices, learning_map_inv):
     """Map class indices (0..n_classes-1) to semantic label IDs via learning_map_inv."""
@@ -66,7 +80,6 @@ def map_class_indices_to_labels(class_indices, learning_map_inv):
         except IndexError:
             pass
     return lut[class_indices]
-
 
 # ---------------------------------------------------------------------------
 # Viridis colormap
@@ -89,34 +102,27 @@ for _i in range(256):
 
 
 def scalar_to_viridis_rgb(values, normalize_range=True):
-    """
-    Map scalar values to RGB using the Viridis colormap (dark = low, yellow = high).
-    Returns (N, 3) RGB in [0, 1].
-    """
+    """Map scalar values to RGB via Viridis colormap. Returns (N, 3) in [0, 1]."""
     v = np.asarray(values, dtype=np.float32).reshape(-1)
     if normalize_range:
         vmin, vmax = np.min(v), np.max(v)
-        rng = vmax - vmin
-        if rng <= 0:
-            rng = 1.0
+        rng = vmax - vmin if (vmax - vmin) > 0 else 1.0
         v = (v - vmin) / rng
     v = np.clip(v, 0.0, 1.0)
     idx = np.clip((v * 255).astype(np.int32), 0, 255)
     return _VIRIDIS_LUT[idx].copy()
 
-
 # ---------------------------------------------------------------------------
 # Mercator projection
 # ---------------------------------------------------------------------------
 
-
 def lat_to_scale(lat_deg):
-    """Mercator scale factor at given latitude (cos(lat))."""
+    """Mercator scale factor at given latitude."""
     return math.cos(math.radians(lat_deg))
 
 
 def latlon_to_mercator_absolute(lat_deg, lon_deg, scale):
-    """Convert lat/lon to Web Mercator (EPSG:3857) x,y in meters."""
+    """Convert lat/lon to Web Mercator x, y in meters."""
     lon_rad = math.radians(lon_deg)
     lat_rad = math.radians(lat_deg)
     x = scale * lon_rad * EARTH_RADIUS_M
@@ -125,10 +131,7 @@ def latlon_to_mercator_absolute(lat_deg, lon_deg, scale):
 
 
 def latlon_to_mercator_relative(lat_deg, lon_deg, origin_lat, origin_lon):
-    """
-    Convert lat/lon to relative world coordinates (meters) using Web Mercator.
-    Origin is at (origin_lat, origin_lon); returns (x, y) relative to that point.
-    """
+    """Convert lat/lon to meters relative to an origin point via Web Mercator."""
     scale = lat_to_scale(origin_lat)
     ox, oy = latlon_to_mercator_absolute(origin_lat, origin_lon, scale)
     mx, my = latlon_to_mercator_absolute(lat_deg, lon_deg, scale)
@@ -136,10 +139,7 @@ def latlon_to_mercator_relative(lat_deg, lon_deg, origin_lat, origin_lon):
 
 
 def mercator_relative_to_latlon(rel_x, rel_y, origin_lat, origin_lon):
-    """
-    Inverse of latlon_to_mercator_relative: convert relative Mercator (meters)
-    back to lat/lon, given the same origin used in the forward transform.
-    """
+    """Inverse of latlon_to_mercator_relative."""
     scale = lat_to_scale(origin_lat)
     origin_lon_rad = math.radians(origin_lon)
     origin_lat_rad = math.radians(origin_lat)
@@ -148,26 +148,21 @@ def mercator_relative_to_latlon(rel_x, rel_y, origin_lat, origin_lon):
     lat_rad = 2.0 * math.atan(math.exp(rel_y / (scale * EARTH_RADIUS_M) + log_origin)) - math.pi / 2
     return math.degrees(lat_rad), math.degrees(lon_rad)
 
-
 # ---------------------------------------------------------------------------
 # OSM geometry rendering
 # ---------------------------------------------------------------------------
-
 
 def create_thick_lines(points, lines, color, radius=2.0):
     """Build Open3D triangle mesh for line segments (cylinders)."""
     meshes = []
     points = np.array(points, dtype=np.float64)
     for line in lines:
-        start = points[line[0]]
-        end = points[line[1]]
+        start, end = points[line[0]], points[line[1]]
         vec = end - start
         length = np.linalg.norm(vec)
         if length < 1e-6:
             continue
-        cyl = o3d.geometry.TriangleMesh.create_cylinder(
-            radius=radius, height=length, resolution=8
-        )
+        cyl = o3d.geometry.TriangleMesh.create_cylinder(radius=radius, height=length, resolution=8)
         cyl.paint_uniform_color(color)
         z_axis = np.array([0.0, 0.0, 1.0])
         direction = vec / length
@@ -175,17 +170,12 @@ def create_thick_lines(points, lines, color, radius=2.0):
         rot_angle = np.arccos(np.clip(np.dot(z_axis, direction), -1.0, 1.0))
         if np.linalg.norm(rot_axis) > 1e-6:
             rot_axis = rot_axis / np.linalg.norm(rot_axis)
-            R_mat = o3d.geometry.get_rotation_matrix_from_axis_angle(
-                rot_axis * rot_angle
-            )
+            R_mat = o3d.geometry.get_rotation_matrix_from_axis_angle(rot_axis * rot_angle)
             cyl.rotate(R_mat, center=[0, 0, 0])
         elif np.dot(z_axis, direction) < 0:
-            R_mat = o3d.geometry.get_rotation_matrix_from_axis_angle(
-                np.array([1.0, 0.0, 0.0]) * np.pi
-            )
+            R_mat = o3d.geometry.get_rotation_matrix_from_axis_angle(np.array([1.0, 0.0, 0.0]) * np.pi)
             cyl.rotate(R_mat, center=[0, 0, 0])
-        midpoint = (start + end) / 2
-        cyl.translate(midpoint)
+        cyl.translate((start + end) / 2)
         meshes.append(cyl)
     if not meshes:
         return None
@@ -211,15 +201,11 @@ class OSMLoader:
     def _parse(self):
         bounds = self.root.find("bounds")
         if bounds is not None:
-            minlat = float(bounds.get("minlat"))
-            minlon = float(bounds.get("minlon"))
-            maxlat = float(bounds.get("maxlat"))
-            maxlon = float(bounds.get("maxlon"))
             if self._origin_latlon is not None:
                 self.origin_lat, self.origin_lon = self._origin_latlon
             else:
-                self.origin_lat = (minlat + maxlat) / 2.0
-                self.origin_lon = (minlon + maxlon) / 2.0
+                self.origin_lat = (float(bounds.get("minlat")) + float(bounds.get("maxlat"))) / 2.0
+                self.origin_lon = (float(bounds.get("minlon")) + float(bounds.get("maxlon"))) / 2.0
         else:
             first_node = self.root.find("node")
             if first_node is not None:
@@ -231,11 +217,8 @@ class OSMLoader:
                 raise ValueError("No bounds or nodes in OSM and no origin given")
         for node in self.root.findall("node"):
             nid = node.get("id")
-            lat = float(node.get("lat"))
-            lon = float(node.get("lon"))
-            x, y = latlon_to_mercator_relative(
-                lat, lon, self.origin_lat, self.origin_lon
-            )
+            lat, lon = float(node.get("lat")), float(node.get("lon"))
+            x, y = latlon_to_mercator_relative(lat, lon, self.origin_lat, self.origin_lon)
             self.nodes[nid] = (x, y)
         for way in self.root.findall("way"):
             node_ids = [nd.get("ref") for nd in way.findall("nd")]
@@ -244,17 +227,13 @@ class OSMLoader:
                 self.ways.append({"nodes": node_ids, "tags": tags})
 
     def get_geometries(self, z_offset=0.0, thickness=2.0, buildings_only=True):
-        """Return list of Open3D TriangleMesh."""
-        batches = defaultdict(
-            lambda: {"points": [], "lines": [], "color": OSM_COLORS["default"]}
-        )
+        """Return list of Open3D TriangleMesh for OSM ways."""
+        batches = defaultdict(lambda: {"points": [], "lines": [], "color": OSM_COLORS["default"]})
         for way in self.ways:
-            tags = way["tags"]
-            node_ids = way["nodes"]
+            tags, node_ids = way["tags"], way["nodes"]
             if buildings_only and "building" not in tags:
                 continue
-            cat = "default"
-            color = OSM_COLORS["default"]
+            cat, color = "default", OSM_COLORS["default"]
             if "building" in tags:
                 cat, color = "building", OSM_COLORS["building"]
             elif not buildings_only and "highway" in tags:
@@ -281,29 +260,117 @@ class OSMLoader:
             start_idx = len(batch["points"])
             batch["points"].extend(points)
             n_pts = len(points)
-            batch["lines"].extend(
-                [[start_idx + i, start_idx + i + 1] for i in range(n_pts - 1)]
-            )
+            batch["lines"].extend([[start_idx + i, start_idx + i + 1] for i in range(n_pts - 1)])
             if cat in ("building", "landuse", "amenity", "natural") and n_pts > 2:
                 batch["lines"].append([start_idx + n_pts - 1, start_idx])
         geometries = []
         for data in batches.values():
             if not data["points"]:
                 continue
-            mesh = create_thick_lines(
-                data["points"], data["lines"], data["color"],
-                radius=thickness / 2.0,
-            )
+            mesh = create_thick_lines(data["points"], data["lines"], data["color"], radius=thickness / 2.0)
             if mesh is not None:
                 geometries.append(mesh)
         return geometries
 
 
 def create_path_geometry(points_xyz, color=(0.0, 0.8, 0.0), thickness=1.5):
-    """Create Open3D geometry for the path (thick line strip). points_xyz: (N, 3)."""
+    """Create Open3D geometry for a path (thick line strip). points_xyz: (N, 3)."""
     if points_xyz is None or len(points_xyz) < 2:
         return None
     lines = [[i, i + 1] for i in range(len(points_xyz) - 1)]
-    return create_thick_lines(
-        points_xyz.tolist(), lines, list(color), radius=thickness / 2.0,
-    )
+    return create_thick_lines(points_xyz.tolist(), lines, list(color), radius=thickness / 2.0)
+
+# ---------------------------------------------------------------------------
+# Accuracy / uncertainty analysis
+# ---------------------------------------------------------------------------
+
+def run_accuracy_analysis(result):
+    """
+    Run accuracy analysis on a multiclass result dict.
+
+    Expects dict with keys: gt_labels, inf_labels, inf_variance, n_classes.
+    Returns (correct_all, uncertainty_all) arrays over all points.
+    """
+    from scipy.stats import rankdata, spearmanr
+    import matplotlib.pyplot as plt
+    from label_mappings import IGNORE_LABELS
+
+    gt_labels = result["gt_labels"]
+    inf_labels = result["inf_labels"]
+    inf_variance = result["inf_variance"]
+    n_classes = result["n_classes"]
+
+    ignore_set = set(IGNORE_LABELS)
+    valid = np.array([g not in ignore_set for g in gt_labels], dtype=bool)
+    print(f"Ignoring {int(np.sum(~valid))} points with GT label in {IGNORE_LABELS}")
+
+    correct_all = (inf_labels == gt_labels)
+    correct = correct_all[valid]
+    n_correct = int(np.sum(correct))
+    n_total = len(correct)
+    print(f"Accuracy: {n_correct}/{n_total} ({100.0 * n_correct / n_total:.2f}%)")
+
+    max_var = (n_classes - 1) / (n_classes ** 2) if n_classes > 1 else 1.0
+    uncertainty_all = 1.0 - np.clip(inf_variance / max_var, 0.0, 1.0)
+    uncertainty = uncertainty_all[valid]
+    median_unc = float(np.median(uncertainty))
+    print(f"Median uncertainty: {median_unc:.6f}")
+
+    low_mask = uncertainty <= median_unc
+    n_kept = int(np.sum(low_mask))
+    n_correct_kept = int(np.sum(correct[low_mask]))
+    accuracy_kept = 100.0 * n_correct_kept / n_kept if n_kept > 0 else 0.0
+    print(f"After removing high-uncertainty: {n_correct_kept}/{n_kept} ({accuracy_kept:.2f}%)")
+
+    incorrect = np.asarray(~correct, dtype=np.float64)
+    rho, p_val = spearmanr(uncertainty, incorrect)
+    print(f"\nSpearman(uncertainty, incorrect): rho={rho:.4f} (p={p_val:.2e})")
+
+    n_incorrect = int(np.sum(incorrect))
+    n_correct_count = n_total - n_incorrect
+    if n_incorrect > 0 and n_correct_count > 0:
+        ranks = rankdata(uncertainty)
+        S = np.sum(ranks[~correct])
+        auroc = (S - n_incorrect * (n_incorrect + 1) / 2) / (n_incorrect * n_correct_count)
+        print(f"AUROC: {auroc:.4f}")
+
+    n_bins = 10
+    bin_edges = np.percentile(uncertainty, np.linspace(0, 100, n_bins + 1))
+    bin_edges[-1] += 1e-9
+    print(f"\nAccuracy by uncertainty bin:")
+    bin_accs, bin_centers = [], []
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        b = (uncertainty >= lo) & (uncertainty < hi)
+        n_b = int(np.sum(b))
+        if n_b > 0:
+            acc_b = 100.0 * np.sum(correct[b]) / n_b
+            bin_accs.append(acc_b)
+            bin_centers.append((lo + hi) / 2)
+            print(f"  bin {i+1:2d} [{lo:.3f}-{hi:.3f}]: {acc_b:.1f}% (n={n_b})")
+    if bin_accs:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(bin_centers, bin_accs, "o-", color="steelblue", linewidth=2, markersize=8)
+        ax.set_xlabel("Uncertainty")
+        ax.set_ylabel("Accuracy (%)")
+        ax.set_title("Accuracy by uncertainty bin")
+        ax.set_ylim(0, 105)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        plt.show(block=True)
+        plt.close(fig)
+
+    var_valid = inf_variance[valid]
+    avg_var = float(np.mean(var_valid))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(var_valid, bins=80, color="steelblue", edgecolor="white", alpha=0.85)
+    ax.axvline(avg_var, color="coral", linewidth=2, label=f"Mean={avg_var:.4f}")
+    ax.set_xlabel("Variance of class probabilities")
+    ax.set_ylabel("Count")
+    ax.set_title(f"Variance distribution (n={n_total})")
+    ax.legend()
+    fig.tight_layout()
+    plt.show(block=True)
+    plt.close(fig)
+
+    return correct_all, uncertainty_all
