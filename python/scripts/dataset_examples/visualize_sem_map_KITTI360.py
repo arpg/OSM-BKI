@@ -339,6 +339,8 @@ def main():
                         help="Load multiclass confidence scores; enables accuracy analysis")
     parser.add_argument("--variance", action="store_true",
                         help="Color by variance (Viridis: yellow=uncertain, dark=confident)")
+    parser.add_argument("--max-uncertainty", type=float, default=None,
+                        help="Keep points with uncertainty <= threshold in [0,1] (multiclass only)")
     parser.add_argument("--view", type=str, choices=["all", "correct", "incorrect"], default="all",
                         help="Filter displayed points (default: all)")
     parser.add_argument("--filter-by-confusion", action="store_true",
@@ -416,6 +418,8 @@ def main():
         mask = np.ones(len(points), dtype=bool)
         if args.filter_by_confusion:
             mask &= filter_by_confusion_matrix(result, uncertainty_all)
+        if args.max_uncertainty is not None:
+            mask &= (uncertainty_all <= float(args.max_uncertainty))
 
         if args.view == "correct":
             mask &= correct

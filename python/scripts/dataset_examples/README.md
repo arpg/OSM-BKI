@@ -23,6 +23,7 @@ Both scripts share a common set of arguments for consistency:
 | `--use-multiclass` | off | Enable multiclass mode with accuracy analysis |
 | `--filter-by-confusion` | off | Filter points using confusion matrix precision (see below) |
 | `--variance` | off | Color by uncertainty (Viridis colormap) |
+| `--max-uncertainty` | off | Keep points with uncertainty <= threshold in [0,1] (multiclass only) |
 | `--view` | `all` | Filter: `all`, `correct`, or `incorrect` |
 | `--with-osm` | off | Overlay OSM building/road outlines |
 | `--osm-thickness` | `2.0` | OSM line thickness (m) |
@@ -70,6 +71,13 @@ python python/scripts/dataset_examples/visualize_sem_map_KITTI360.py \
     --use-multiclass --variance --view incorrect
 ```
 
+With uncertainty thresholding:
+
+```bash
+python python/scripts/dataset_examples/visualize_sem_map_KITTI360.py \
+    --use-multiclass --max-uncertainty 0.3
+```
+
 With confusion-matrix filtering:
 
 ```bash
@@ -111,6 +119,13 @@ With confusion-matrix filtering:
 ```bash
 python python/scripts/dataset_examples/visualize_sem_map_MCD.py \
     --use-multiclass --filter-by-confusion
+```
+
+With uncertainty thresholding:
+
+```bash
+python python/scripts/dataset_examples/visualize_sem_map_MCD.py \
+    --use-multiclass --max-uncertainty 0.3
 ```
 
 ## Confusion Matrix Filtering
