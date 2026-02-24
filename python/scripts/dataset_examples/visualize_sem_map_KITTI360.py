@@ -341,6 +341,8 @@ def main():
                         help="Color by variance (Viridis: yellow=uncertain, dark=confident)")
     parser.add_argument("--view", type=str, choices=["all", "correct", "incorrect"], default="all",
                         help="Filter displayed points (default: all)")
+    parser.add_argument("--filter-by-confusion", action="store_true",
+                        help="Use confusion matrix precision to filter uncertain predictions per class")
     parser.add_argument("--with-osm", action="store_true", help="Overlay OSM map")
     parser.add_argument("--osm-thickness", type=float, default=2.0, help="OSM line thickness in meters")
     parser.add_argument("--osm-all", action="store_true", help="Show all OSM features (default: buildings only)")
@@ -409,14 +411,16 @@ def main():
         points = result["points"]
         print(f"Total points: {len(points)}")
 
-        correct, _ = run_accuracy_analysis(result)
+        correct, uncertainty_all, _, _ = run_accuracy_analysis(result)
+
+        mask = np.ones(len(points), dtype=bool)
+        if args.filter_by_confusion:
+            mask &= filter_by_confusion_matrix(result, uncertainty_all)
 
         if args.view == "correct":
-            mask = correct
+            mask &= correct
         elif args.view == "incorrect":
-            mask = ~correct
-        else:
-            mask = np.ones(len(points), dtype=bool)
+            mask &= ~correct
         print(f"Showing {int(np.sum(mask))} points (view={args.view})")
 
         pts = points[mask]

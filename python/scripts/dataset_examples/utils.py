@@ -289,7 +289,11 @@ def run_accuracy_analysis(result):
     Run accuracy analysis on a multiclass result dict.
 
     Expects dict with keys: gt_labels, inf_labels, inf_variance, n_classes.
-    Returns (correct_all, uncertainty_all) arrays over all points.
+    Returns (correct_all, uncertainty_all, bin_edges, bin_acc_array).
+      - correct_all: (N,) bool
+      - uncertainty_all: (N,) float in [0, 1]
+      - bin_edges: (n_bins+1,) uncertainty bin boundaries
+      - bin_acc_array: (n_bins,) accuracy in [0, 1] per bin
     """
     from scipy.stats import rankdata, spearmanr
     import matplotlib.pyplot as plt
@@ -308,20 +312,24 @@ def run_accuracy_analysis(result):
     correct = correct_all[valid]
     n_correct = int(np.sum(correct))
     n_total = len(correct)
-    print(f"Accuracy: {n_correct}/{n_total} ({100.0 * n_correct / n_total:.2f}%)")
 
     max_var = (n_classes - 1) / (n_classes ** 2) if n_classes > 1 else 1.0
     uncertainty_all = 1.0 - np.clip(inf_variance / max_var, 0.0, 1.0)
     uncertainty = uncertainty_all[valid]
     median_unc = float(np.median(uncertainty))
+
+    # -- Baseline accuracy (all valid points) ------------------------------
+    print(f"Accuracy (all): {n_correct}/{n_total} ({100.0 * n_correct / n_total:.2f}%)")
     print(f"Median uncertainty: {median_unc:.6f}")
 
+    # -- Accuracy after removing above-median uncertainty (diagnostic) -----
     low_mask = uncertainty <= median_unc
     n_kept = int(np.sum(low_mask))
     n_correct_kept = int(np.sum(correct[low_mask]))
     accuracy_kept = 100.0 * n_correct_kept / n_kept if n_kept > 0 else 0.0
-    print(f"After removing high-uncertainty: {n_correct_kept}/{n_kept} ({accuracy_kept:.2f}%)")
+    print(f"Accuracy (median threshold): {n_correct_kept}/{n_kept} ({accuracy_kept:.2f}%)")
 
+    # -- Uncertainty calibration -------------------------------------------
     incorrect = np.asarray(~correct, dtype=np.float64)
     rho, p_val = spearmanr(uncertainty, incorrect)
     print(f"\nSpearman(uncertainty, incorrect): rho={rho:.4f} (p={p_val:.2e})")
@@ -337,20 +345,24 @@ def run_accuracy_analysis(result):
     n_bins = 10
     bin_edges = np.percentile(uncertainty, np.linspace(0, 100, n_bins + 1))
     bin_edges[-1] += 1e-9
+    bin_acc_array = np.ones(n_bins, dtype=np.float64)
+    bin_centers = np.zeros(n_bins, dtype=np.float64)
+    bin_counts = np.zeros(n_bins, dtype=np.int64)
     print(f"\nAccuracy by uncertainty bin:")
-    bin_accs, bin_centers = [], []
     for i in range(n_bins):
         lo, hi = bin_edges[i], bin_edges[i + 1]
+        bin_centers[i] = (lo + hi) / 2
         b = (uncertainty >= lo) & (uncertainty < hi)
         n_b = int(np.sum(b))
+        bin_counts[i] = n_b
         if n_b > 0:
-            acc_b = 100.0 * np.sum(correct[b]) / n_b
-            bin_accs.append(acc_b)
-            bin_centers.append((lo + hi) / 2)
-            print(f"  bin {i+1:2d} [{lo:.3f}-{hi:.3f}]: {acc_b:.1f}% (n={n_b})")
-    if bin_accs:
+            bin_acc_array[i] = float(np.sum(correct[b])) / n_b
+            print(f"  bin {i+1:2d} [{lo:.3f}-{hi:.3f}]: {100.0 * bin_acc_array[i]:.1f}% (n={n_b})")
+    non_empty = bin_counts > 0
+    if np.any(non_empty):
         fig, ax = plt.subplots(figsize=(7, 4))
-        ax.plot(bin_centers, bin_accs, "o-", color="steelblue", linewidth=2, markersize=8)
+        ax.plot(bin_centers[non_empty], bin_acc_array[non_empty] * 100.0,
+                "o-", color="steelblue", linewidth=2, markersize=8)
         ax.set_xlabel("Uncertainty")
         ax.set_ylabel("Accuracy (%)")
         ax.set_title("Accuracy by uncertainty bin")
@@ -373,4 +385,91 @@ def run_accuracy_analysis(result):
     plt.show(block=True)
     plt.close(fig)
 
-    return correct_all, uncertainty_all
+    return correct_all, uncertainty_all, bin_edges, bin_acc_array
+
+
+def filter_by_confusion_matrix(result, uncertainty_all):
+    """
+    Filter points using the confusion matrix.
+
+    Builds a confusion matrix (predicted × true) over valid points.  For each
+    predicted class, precision = P(correct | predicted as that class).  The
+    precision is then used as a percentile threshold on uncertainty: for a
+    class with 80% precision, keep the 80% most confident predictions (drop
+    the 20% most uncertain).  High-precision classes keep nearly everything;
+    low-precision classes are aggressively pruned.
+
+    Points with ignored GT labels are always kept.
+    Returns a boolean keep mask (True = keep).
+    """
+    from label_mappings import IGNORE_LABELS, COMMON_LABELS, N_COMMON
+
+    gt_labels = result["gt_labels"]
+    inf_labels = result["inf_labels"]
+
+    ignore_set = set(IGNORE_LABELS)
+    valid = np.array([g not in ignore_set for g in gt_labels], dtype=bool)
+    correct = (inf_labels == gt_labels)
+
+    # -- Build confusion matrix (rows = predicted, cols = true) ------------
+    conf = np.zeros((N_COMMON, N_COMMON), dtype=np.int64)
+    for pred, gt in zip(inf_labels[valid], gt_labels[valid]):
+        if 0 <= pred < N_COMMON and 0 <= gt < N_COMMON:
+            conf[pred, gt] += 1
+
+    # -- Print confusion matrix --------------------------------------------
+    present = sorted(set(np.unique(inf_labels[valid])) | set(np.unique(gt_labels[valid])))
+    present = [c for c in present if c in COMMON_LABELS and c not in ignore_set]
+    abbrev = {c: COMMON_LABELS[c][:7] for c in present}
+
+    header = "pred\\true  " + "  ".join(f"{abbrev[c]:>7s}" for c in present)
+    print(f"\nConfusion matrix (rows=predicted, cols=true):\n{header}")
+    for p in present:
+        row_vals = "  ".join(f"{conf[p, t]:7d}" for t in present)
+        total_p = int(np.sum(conf[p, :]))
+        prec = conf[p, p] / total_p * 100 if total_p > 0 else 0.0
+        print(f"  {abbrev[p]:>7s}   {row_vals}   prec={prec:.1f}%")
+
+    # -- Filter using precision as keep-percentile -------------------------
+    keep = np.ones(len(uncertainty_all), dtype=bool)
+
+    print(f"\nPrecision-based filtering:")
+    for cls in sorted(np.unique(inf_labels)):
+        cls_valid = (inf_labels == cls) & valid
+        n_cls = int(np.sum(cls_valid))
+        if n_cls == 0:
+            continue
+
+        cls_name = COMMON_LABELS.get(int(cls), f"class_{cls}")
+        total_predicted = int(np.sum(conf[cls, :]))
+        precision = conf[cls, cls] / total_predicted if total_predicted > 0 else 0.0
+
+        if precision >= 1.0 or n_cls == 0:
+            acc_cls = 100.0 * np.sum(correct[cls_valid]) / n_cls
+            print(f"  {cls_name:15s}: prec=100.0%  kept {n_cls}/{n_cls}  acc {acc_cls:.1f}%")
+            continue
+
+        cls_unc = uncertainty_all[cls_valid]
+        threshold = float(np.percentile(cls_unc, precision * 100))
+        above = cls_valid & (uncertainty_all > threshold)
+        keep[above] = False
+
+        n_kept = int(np.sum(keep[cls_valid]))
+        acc_before = 100.0 * np.sum(correct[cls_valid]) / n_cls
+        acc_after = 100.0 * np.sum(correct[cls_valid & keep]) / n_kept if n_kept > 0 else 0.0
+        print(f"  {cls_name:15s}: prec={100*precision:.1f}%  "
+              f"kept {n_kept}/{n_cls}  acc {acc_before:.1f}% -> {acc_after:.1f}%")
+
+    keep[~valid] = True
+
+    n_total = len(keep)
+    n_kept = int(np.sum(keep))
+    print(f"Total: kept {n_kept}/{n_total} (dropped {n_total - n_kept})")
+
+    kept_valid = keep & valid
+    n_kv = int(np.sum(kept_valid))
+    if n_kv > 0:
+        n_correct = int(np.sum(correct[kept_valid]))
+        print(f"Accuracy after filtering: {n_correct}/{n_kv} ({100.0 * n_correct / n_kv:.2f}%)")
+
+    return keep
