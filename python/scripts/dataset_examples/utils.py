@@ -8,6 +8,7 @@ from collections import defaultdict
 
 import numpy as np
 import open3d as o3d
+import os
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -27,8 +28,6 @@ OSM_COLORS = {
 # ---------------------------------------------------------------------------
 # Binary file I/O
 # ---------------------------------------------------------------------------
-
-
 def read_bin_file(file_path, dtype, shape=None):
     """Read a .bin file and optionally reshape."""
     data = np.fromfile(file_path, dtype=dtype)
@@ -36,11 +35,26 @@ def read_bin_file(file_path, dtype, shape=None):
         return data.reshape(shape)
     return data
 
-
 # ---------------------------------------------------------------------------
 # Label mapping helpers
 # ---------------------------------------------------------------------------
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OSMBKI_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
+INFERRED_LABEL_CONFIGS = {
+    "mcd": os.path.join(_SCRIPT_DIR, "labels_mcd.yaml"),
+    "semkitti": os.path.join(_SCRIPT_DIR, "labels_semkitti.yaml"),
+    "kitti360": os.path.join(_SCRIPT_DIR, "labels_kitti360.yaml"),
+}
+INFERRED_SUBDIRS = {
+    "mcd": "cenet_mcd",
+    "semkitti": "cenet_semkitti",
+    "kitti360": "cenet_kitti360",
+}
+
+# GPS origins (lat, lon) for each dataset's world-frame origin
+KITTI360_ORIGIN_LATLON = (48.9843445, 8.4295857)
+MCD_ORIGIN_LATLON = (59.347671416, 18.072069652)
 
 def map_class_indices_to_labels(class_indices, learning_map_inv):
     """Map class indices (0..n_classes-1) to semantic label IDs via learning_map_inv."""

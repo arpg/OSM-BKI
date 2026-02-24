@@ -14,20 +14,16 @@ import yaml
 from tqdm import tqdm
 
 from utils import *
-from label_mappings import build_to_common_lut, apply_common_lut, common_labels_to_colors
+from label_mappings import build_to_common_lut, apply_common_lut, common_labels_to_colors, IGNORE_LABELS
 
-ORIGIN_LATLON = [59.347671416, 18.072069652]  # GPS at world-frame origin (0,0,0)
+DEFAULT_CONFIG_PATH = INFERRED_LABEL_CONFIGS["mcd"]
 
-# MCD label config path relative to project root
-DEFAULT_CONFIG_PATH = os.path.join("./python/scripts/dataset_examples/labels_mcd.yaml")
-
-# Body to LiDAR transformation matrix
-BODY_TO_LIDAR_TF = np.array([
-    [0.9999135040741837, -0.011166365511073898, -0.006949579221822984, -0.04894521120494695],
-    [-0.011356389542502144, -0.9995453006865824, -0.02793249526856565, -0.03126929060348084],
-    [-0.006634514801117132, 0.02800900135032654, -0.999585653686922, -0.01755515794222565],
-    [0.0, 0.0, 0.0, 1.0]
-])
+def load_body_to_lidar_tf(calib_path, sensor_key="os_sensor"):
+    """Load the body-to-LiDAR 4x4 transform from a calibration YAML (body -> sensor_key -> T)."""
+    with open(calib_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    T = cfg["body"][sensor_key]["T"]
+    return np.array(T, dtype=np.float64)
 
 def load_label_config(config_path):
     """
@@ -147,209 +143,20 @@ def _parse_single_label(single_label_arg, label_config):
 
 def load_poses(poses_file):
     """
-    Load poses from CSV file.
-    
-    Args:
-        poses_file: Path to CSV file with poses (num, t, x, y, z, qx, qy, qz, qw)
-    
-    Returns:
-        poses: Dictionary mapping timestamp to [index, x, y, z, qx, qy, qz, qw]
-        index_to_timestamp: Dictionary mapping index to timestamp
+    Load poses from CSV with columns: num, t, x, y, z, qx, qy, qz, qw.
+
+    Returns dict mapping scan number (int) to [x, y, z, qx, qy, qz, qw].
     """
-    print(f"\nLoading poses from {poses_file}")
-    
-    # First, inspect the CSV file to understand its format
-    try:
-        # Read first few lines to inspect format
-        with open(poses_file, 'r') as f:
-            first_lines = [f.readline().strip() for _ in range(5)]
-        
-        print(f"\nCSV file inspection:")
-        print(f"  First 3 lines of file:")
-        for i, line in enumerate(first_lines[:3]):
-            print(f"    Line {i+1}: {line[:100]}")  # Print first 100 chars
-        
-        # Try different reading strategies
-        df = None
-        
-        # Strategy 1: Try with header, handling comment lines
-        try:
-            df = pd.read_csv(poses_file, comment='#', skipinitialspace=True)
-            print(f"\n  Attempted to read with header (comment='#')")
-            print(f"  Columns found: {list(df.columns)}")
-            print(f"  Number of columns: {len(df.columns)}")
-            
-            # Check if we have the expected columns (handle various naming conventions)
-            col_names = [str(col).strip().lower().replace('#', '').replace(' ', '') for col in df.columns]
-            has_timestamp_col = any('timestamp' in col or col == 't' for col in col_names)
-            has_pose_cols = all(any(coord in col for col in col_names) for coord in ['x', 'y', 'z', 'qx', 'qy', 'qz', 'qw'])
-            
-            # Check for num column (optional)
-            has_num_col = any('num' in col for col in col_names)
-            
-            if has_timestamp_col and has_pose_cols and (len(df.columns) >= 8 or (has_num_col and len(df.columns) >= 9)):
-                print(f"  ✓ Format detected: Has header with column names")
-                if has_num_col:
-                    print(f"    Note: Found 'num' column, will be ignored")
-            elif len(df.columns) == 8 or len(df.columns) == 9:
-                print(f"  ⚠ Format: {len(df.columns)} columns but unclear header format, trying positional")
-                df = None  # Will try positional
-            else:
-                print(f"  ⚠ Format: Unexpected column count ({len(df.columns)}), trying positional")
-                df = None
-        except Exception as e:
-            print(f"  Failed to read with header: {e}")
-            df = None
-        
-        # Strategy 2: Try without header (positional)
-        if df is None:
-            try:
-                df = pd.read_csv(poses_file, comment='#', header=None, skipinitialspace=True)
-                print(f"\n  Attempted to read without header (positional)")
-                print(f"  Number of columns: {len(df.columns)}")
-                if len(df.columns) >= 8:
-                    print(f"  ✓ Format detected: No header, using positional indexing")
-                else:
-                    print(f"  ✗ Error: Only {len(df.columns)} columns found, need at least 8")
-                    return {}
-            except Exception as e:
-                print(f"  Failed to read without header: {e}")
-                return {}
-        
-        print(f"\n  Successfully read CSV with {len(df)} rows and {len(df.columns)} columns")
-        print(f"  First few data rows:")
-        print(df.head(3))
-        
-    except Exception as e:
-        print(f"Error reading CSV: {e}")
-        import traceback
-        traceback.print_exc()
-        return {}
-    
+    df = pd.read_csv(poses_file)
     poses = {}
-    index_to_timestamp = {}
-    
-    for idx, row in df.iterrows():
-        try:
-            # Try to get timestamp and index - handle various column name formats
-            timestamp = None
-            pose_index = None
-            x, y, z, qx, qy, qz, qw = None, None, None, None, None, None, None
-            
-            # Build column map for pose values
-            col_map = {}
-            for col in df.columns:
-                col_clean = str(col).strip().lower().replace('#', '').replace(' ', '')
-                col_map[col_clean] = col
-            
-            # Check for timestamp column (handle various naming: 't', 'timestamp', etc.)
-            for col in df.columns:
-                col_clean = str(col).strip().lower().replace('#', '').replace(' ', '')
-                # Check for 't' (single letter) or 'timestamp'
-                if col_clean == 't' or 'timestamp' in col_clean:
-                    timestamp = row[col]
-                    break
-            
-            # Check for index column ('num')
-            if 'num' in col_map:
-                pose_index = int(row[col_map['num']])
-            
-            # Get pose values by column name
-            if timestamp is not None:
-                # We have a timestamp column, get pose values by name
-                x = row.get(col_map.get('x'), None) if 'x' in col_map else None
-                y = row.get(col_map.get('y'), None) if 'y' in col_map else None
-                z = row.get(col_map.get('z'), None) if 'z' in col_map else None
-                qx = row.get(col_map.get('qx'), None) if 'qx' in col_map else None
-                qy = row.get(col_map.get('qy'), None) if 'qy' in col_map else None
-                qz = row.get(col_map.get('qz'), None) if 'qz' in col_map else None
-                qw = row.get(col_map.get('qw'), None) if 'qw' in col_map else None
-            else:
-                # No timestamp column found, use positional indexing
-                # Format: [num, t, x, y, z, qx, qy, qz, qw] or [t, x, y, z, qx, qy, qz, qw]
-                if len(row) >= 9:
-                    # Has num column: first column is index
-                    pose_index = int(row.iloc[0])
-                    timestamp = row.iloc[1]
-                    x = row.iloc[2]
-                    y = row.iloc[3]
-                    z = row.iloc[4]
-                    qx = row.iloc[5]
-                    qy = row.iloc[6]
-                    qz = row.iloc[7]
-                    qw = row.iloc[8]
-                elif len(row) >= 8:
-                    # No num column
-                    timestamp = row.iloc[0]
-                    x = row.iloc[1]
-                    y = row.iloc[2]
-                    z = row.iloc[3]
-                    qx = row.iloc[4]
-                    qy = row.iloc[5]
-                    qz = row.iloc[6]
-                    qw = row.iloc[7]
-                else:
-                    if idx < 5:
-                        print(f"  Row {idx} has only {len(row)} columns, need at least 8, skipping")
-                    continue
-            
-            # Validate all values are present
-            if None in [timestamp, x, y, z, qx, qy, qz, qw]:
-                if idx < 5:
-                    print(f"  Row {idx} missing values, skipping")
-                continue
-            
-            # Store pose with index: [index, x, y, z, qx, qy, qz, qw]
-            pose = [pose_index, float(x), float(y), float(z), float(qx), float(qy), float(qz), float(qw)]
-            poses[float(timestamp)] = pose
-            
-            # Store index to timestamp mapping
-            if pose_index is not None:
-                index_to_timestamp[pose_index] = float(timestamp)
-        except Exception as e:
-            if idx < 5:  # Only print first few errors
-                print(f"  Error processing row {idx}: {e}")
-                print(f"  Row data: {row.tolist()[:9] if len(row) >= 9 else row.tolist()}")
-            continue
-    
-    print(f"\nSuccessfully loaded {len(poses)} poses")
-    if len(poses) > 0:
-        sample_ts = list(poses.keys())[0]
-        sample_pose = poses[sample_ts]
-        print(f"  Sample pose (timestamp {sample_ts}, index {sample_pose[0]}): position=[{sample_pose[1]:.2f}, {sample_pose[2]:.2f}, {sample_pose[3]:.2f}], quat=[{sample_pose[4]:.3f}, {sample_pose[5]:.3f}, {sample_pose[6]:.3f}, {sample_pose[7]:.3f}]")
-    return poses, index_to_timestamp
-
-
-def find_closest_pose(timestamp, poses_dict, exact_match_threshold=0.001):
-    """
-    Find the closest pose timestamp to the given timestamp.
-    
-    Args:
-        timestamp: Target timestamp
-        poses_dict: Dictionary mapping timestamp to pose
-        exact_match_threshold: Time difference threshold in seconds to consider an exact match (default: 0.001s = 1ms)
-    
-    Returns:
-        Tuple of (closest timestamp key, time_difference), or (None, None) if poses_dict is empty
-        Returns None for timestamp if no exact match found (time_diff > threshold)
-    """
-    if not poses_dict:
-        return None, None
-    
-    pose_timestamps = np.array(list(poses_dict.keys()))
-    time_diffs = np.abs(pose_timestamps - timestamp)
-    closest_idx = np.argmin(time_diffs)
-    closest_ts = pose_timestamps[closest_idx]
-    time_diff = time_diffs[closest_idx]
-    
-    # Check if it's an exact match
-    if time_diff > exact_match_threshold:
-        # Warn but return None to indicate no exact match
-        print(f"  WARNING: No exact pose match for timestamp {timestamp:.6f}. "
-              f"Closest pose at {closest_ts:.6f} (difference: {time_diff:.6f}s). Skipping scan.")
-        return None, time_diff
-    
-    return closest_ts, time_diff
+    for _, row in df.iterrows():
+        num = int(row["num"])
+        poses[num] = [
+            float(row["x"]), float(row["y"]), float(row["z"]),
+            float(row["qx"]), float(row["qy"]), float(row["qz"]), float(row["qw"]),
+        ]
+    print(f"Loaded {len(poses)} poses from {poses_file}")
+    return poses
 
 
 def transform_points_to_world(points_xyz, position, quaternion, body_to_lidar_tf=None):
@@ -404,42 +211,166 @@ def get_mcd_osm_path(dataset_path, osm_filename="kth.osm"):
     return os.path.join(dataset_path, osm_filename)
 
 
-def build_path_from_poses(poses_dict, index_to_timestamp):
+def build_path_from_poses(poses):
     """Extract world-frame path positions from MCD poses. Returns (N,3) array or None."""
-    if not poses_dict or not index_to_timestamp:
+    if not poses:
         return None
-    sorted_indices = sorted(index_to_timestamp.keys())
     positions = []
-    for idx in sorted_indices:
-        ts = index_to_timestamp[idx]
-        if ts in poses_dict:
-            pose = poses_dict[ts]
-            positions.append([pose[1], pose[2], pose[3]])
+    for num in sorted(poses.keys()):
+        p = poses[num]
+        positions.append([p[0], p[1], p[2]])
     if len(positions) < 2:
         return None
     return np.array(positions, dtype=np.float64)
 
 
-def compare_gt_inferred_map(dataset_path, seq_name, label_config,
+def build_semantic_map_mcd(dataset_path, seq_name, body_to_lidar_tf,
+                           max_scans=None, downsample_factor=1, voxel_size=0.1, max_distance=None,
+                           with_osm=False, osm_thickness=2.0, osm_all=False,
+                           with_path=False, path_thickness=1.5):
+    """
+    Build a one-hot GT semantic map for MCD: load GT labels, transform to world, color by common taxonomy.
+    """
+    root_path = os.path.join(dataset_path, seq_name)
+    data_dir = os.path.join(root_path, "lidar_bin/data")
+    poses_file = os.path.join(root_path, "pose_inW.csv")
+    gt_labels_dir = os.path.join(root_path, "gt_labels")
+
+    gt_common_lut = build_to_common_lut("mcd")
+
+    if not os.path.exists(data_dir) or not os.path.exists(poses_file):
+        print("ERROR: Data directory or poses file not found.")
+        return
+    if not os.path.exists(gt_labels_dir):
+        print(f"ERROR: GT labels directory not found: {gt_labels_dir}")
+        return
+
+    poses = load_poses(poses_file)
+    if not poses:
+        print("ERROR: No poses loaded.")
+        return
+
+    sorted_pose_indices = sorted(poses.keys())
+    if downsample_factor > 1:
+        sorted_pose_indices = sorted_pose_indices[::downsample_factor]
+    if max_scans:
+        sorted_pose_indices = sorted_pose_indices[:max_scans]
+
+    all_points = []
+    all_colors = []
+
+    for pose_num in tqdm(sorted_pose_indices, desc="Loading scans", unit="scan"):
+        pose_data = poses[pose_num]
+        position = pose_data[0:3]
+        quaternion = pose_data[3:7]
+        bin_file = f"{pose_num:010d}.bin"
+        bin_path = os.path.join(data_dir, bin_file)
+        gt_path = os.path.join(gt_labels_dir, bin_file)
+        if not os.path.exists(bin_path) or not os.path.exists(gt_path):
+            continue
+        try:
+            points = read_bin_file(bin_path, dtype=np.float32, shape=(-1, 4))
+            points_xyz = points[:, :3]
+            gt_lbl_raw = read_bin_file(gt_path, dtype=np.int32, shape=(-1))
+            if len(gt_lbl_raw) != len(points_xyz):
+                continue
+        except Exception as e:
+            tqdm.write(f"  Error {bin_file}: {e}")
+            continue
+
+        world = transform_points_to_world(points_xyz, position, quaternion, body_to_lidar_tf)
+        if max_distance is not None and max_distance > 0:
+            dist_mask = np.linalg.norm(world - position, axis=1) <= max_distance
+            world = world[dist_mask]
+            gt_lbl_raw = gt_lbl_raw[dist_mask]
+
+        colors = common_labels_to_colors(apply_common_lut(gt_lbl_raw, gt_common_lut))
+
+        if voxel_size is not None and voxel_size > 0 and len(world) > 0:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(world.astype(np.float64))
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+            pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+            world = np.asarray(pcd.points)
+            colors = np.asarray(pcd.colors)
+
+        all_points.append(world.astype(np.float64))
+        all_colors.append(colors)
+
+    if not all_points:
+        print("ERROR: No points accumulated.")
+        return
+
+    points = np.vstack(all_points)
+    colors = np.vstack(all_colors)
+    print(f"Total points: {len(points)}")
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    extra_geoms = []
+    path_z_default = 0.0
+
+    if with_path or with_osm:
+        path_xyz = build_path_from_poses(poses)
+        if path_xyz is not None and len(path_xyz) >= 2:
+            path_z_default = float(np.median(path_xyz[:, 2]))
+            if with_path:
+                path_geom = create_path_geometry(path_xyz, color=(0.0, 0.8, 0.0), thickness=path_thickness)
+                if path_geom is not None:
+                    extra_geoms.append(path_geom)
+                    print(f"Path: {len(path_xyz)} poses")
+        else:
+            if with_path:
+                print("Warning: not enough poses for path geometry.", file=sys.stderr)
+
+    if with_osm:
+        osm_file = get_mcd_osm_path(dataset_path)
+        if os.path.isfile(osm_file):
+            print(f"Loading OSM: {osm_file}")
+            loader = OSMLoader(osm_file, origin_latlon=MCD_ORIGIN_LATLON)
+            osm_geoms = loader.get_geometries(
+                z_offset=path_z_default, thickness=osm_thickness, buildings_only=not osm_all,
+            )
+            if osm_geoms:
+                extra_geoms.extend(osm_geoms)
+                kind = "building" if not osm_all else "geometry"
+                print(f"OSM: {len(osm_geoms)} {kind} groups")
+        else:
+            print(f"OSM file not found: {osm_file}", file=sys.stderr)
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window()
+    vis.add_geometry(pcd)
+    for geom in extra_geoms:
+        vis.add_geometry(geom)
+    opt = vis.get_render_option()
+    opt.background_color = np.array([0.5, 0.5, 0.5], dtype=np.float64)
+    vis.run()
+    vis.destroy_window()
+
+
+def compare_gt_inferred_map(dataset_path, seq_name, label_config, body_to_lidar_tf,
+                            labels_key="semkitti", inf_learning_map_inv=None,
                             max_scans=None, downsample_factor=1, voxel_size=0.1, max_distance=None,
-                            view_mode="all", view_variance=False, use_second_above_median=False,
+                            view_mode="all", view_variance=False,
                             with_osm=False, osm_thickness=2.0, osm_all=False,
                             with_path=False, path_thickness=1.5):
     """
     Build GT map (world points + gt labels) and inferred map (world points + dominant class).
-    For each inferred point, find nearest GT point via KD-tree and compare labels.
-    view_mode: "all" | "correct" | "incorrect" — show all inferred points, or only correct/incorrect.
-    view_variance: If True, color by variance of class probabilities (Viridis: yellow=uncertain, dark=confident).
+    GT labels are MCD raw IDs; inferred labels come from the network specified by labels_key.
     """
+    infer_subdir = INFERRED_SUBDIRS.get(labels_key, f"cenet_{labels_key}")
     root_path = os.path.join(dataset_path, seq_name)
     data_dir = os.path.join(root_path, "lidar_bin/data")
-    timestamps_file = os.path.join(root_path, "lidar_bin/timestamps.txt")
     poses_file = os.path.join(root_path, "pose_inW.csv")
     gt_labels_dir = os.path.join(root_path, "gt_labels")
-    multiclass_dir = os.path.join(root_path, "inferred_labels", "cenet_semkitti", "multiclass_confidence_scores")
+    multiclass_dir = os.path.join(root_path, "inferred_labels", infer_subdir, "multiclass_confidence_scores")
 
-    learning_map_inv = label_config["learning_map_inv"]
-    common_lut = build_to_common_lut("mcd")
+    learning_map_inv = inf_learning_map_inv if inf_learning_map_inv is not None else label_config["learning_map_inv"]
+    gt_common_lut = build_to_common_lut("mcd")
+    inf_common_lut = build_to_common_lut(labels_key)
 
     if not os.path.exists(data_dir) or not os.path.exists(poses_file):
         print("ERROR: Data directory or poses file not found.")
@@ -450,17 +381,13 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
     if not os.path.exists(multiclass_dir):
         print(f"ERROR: Multiclass directory not found: {multiclass_dir}")
         return
-    if os.path.exists(timestamps_file):
-        timestamps = np.loadtxt(timestamps_file)
-    else:
-        timestamps = np.array([])
 
-    poses_dict, index_to_timestamp = load_poses(poses_file)
-    if not poses_dict or not index_to_timestamp:
-        print("ERROR: No poses loaded or no index column.")
+    poses = load_poses(poses_file)
+    if not poses:
+        print("ERROR: No poses loaded.")
         return
 
-    sorted_pose_indices = sorted(index_to_timestamp.keys())
+    sorted_pose_indices = sorted(poses.keys())
     if downsample_factor > 1:
         sorted_pose_indices = sorted_pose_indices[::downsample_factor]
     if max_scans:
@@ -470,22 +397,18 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
     all_gt_labels = []
     all_inf_points = []
     all_inf_labels = []
-    all_inf_labels_second = []  # second-highest class (for --use-second-above-median)
-    all_inf_variance = []  # variance of class probs (always computed, for reporting)
-    all_inf_uncertainty = []  # 0=confident, 1=uncertain (for variance coloring when --variance)
+    all_inf_variance = []
+    all_inf_uncertainty = []
 
     for pose_num in tqdm(sorted_pose_indices, desc="Loading scans", unit="scan"):
-        pose_timestamp = index_to_timestamp[pose_num]
-        pose_data = poses_dict[pose_timestamp]
-        position = pose_data[1:4]
-        quaternion = pose_data[4:8]
+        pose_data = poses[pose_num]
+        position = pose_data[0:3]
+        quaternion = pose_data[3:7]
         bin_file = f"{pose_num:010d}.bin"
         bin_path = os.path.join(data_dir, bin_file)
         gt_path = os.path.join(gt_labels_dir, bin_file)
         multiclass_path = os.path.join(multiclass_dir, bin_file)
         if not os.path.exists(bin_path) or not os.path.exists(gt_path) or not os.path.exists(multiclass_path):
-            continue
-        if len(timestamps) > 0 and pose_num - 1 < len(timestamps) and abs(timestamps[pose_num - 1] - pose_timestamp) > 0.1:
             continue
         try:
             points = read_bin_file(bin_path, dtype=np.float32, shape=(-1, 4))
@@ -497,14 +420,10 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
             if len(gt_lbl_raw) != n_points or len(raw_probs) != n_points * n_classes:
                 continue
             multiclass_probs = raw_probs.reshape(n_points, n_classes)
-            gt_lbl = apply_common_lut(gt_lbl_raw, common_lut)
+            gt_lbl = apply_common_lut(gt_lbl_raw, gt_common_lut)
             class_indices = np.argmax(multiclass_probs, axis=1)
             inf_lbl = apply_common_lut(
-                map_class_indices_to_labels(class_indices, learning_map_inv), common_lut,
-            )
-            second_class_indices = np.argsort(multiclass_probs, axis=1)[:, -2]
-            inf_lbl_second = apply_common_lut(
-                map_class_indices_to_labels(second_class_indices, learning_map_inv), common_lut,
+                map_class_indices_to_labels(class_indices, learning_map_inv), inf_common_lut,
             )
             # Variance of class probs (always store for average-variance report)
             variances = np.var(multiclass_probs.astype(np.float32), axis=1)
@@ -519,13 +438,12 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
             tqdm.write(f"  Error {bin_file}: {e}")
             continue
 
-        world = transform_points_to_world(points_xyz, position, quaternion, BODY_TO_LIDAR_TF)
+        world = transform_points_to_world(points_xyz, position, quaternion, body_to_lidar_tf)
         if max_distance is not None and max_distance > 0:
             dist_mask = np.linalg.norm(world - position, axis=1) <= max_distance
             world = world[dist_mask]
             gt_lbl = gt_lbl[dist_mask]
             inf_lbl = inf_lbl[dist_mask]
-            inf_lbl_second = inf_lbl_second[dist_mask]
             variances = variances[dist_mask]
             if uncertainty is not None:
                 uncertainty = uncertainty[dist_mask]
@@ -540,7 +458,6 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
             _, idx = tree_scan.query(world_ds, k=1)
             gt_lbl = gt_lbl[idx]
             inf_lbl = inf_lbl[idx]
-            inf_lbl_second = inf_lbl_second[idx]
             variances = variances[idx]
             if uncertainty is not None:
                 uncertainty = uncertainty[idx]
@@ -549,7 +466,6 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
         all_gt_labels.append(gt_lbl)
         all_inf_points.append(world.astype(np.float64))
         all_inf_labels.append(inf_lbl)
-        all_inf_labels_second.append(inf_lbl_second)
         all_inf_variance.append(variances)
         if view_variance:
             all_inf_uncertainty.append(uncertainty)
@@ -561,18 +477,24 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
     gt_labels = np.concatenate(all_gt_labels)
     inf_points = np.vstack(all_inf_points)
     inf_labels = np.concatenate(all_inf_labels)
-    inf_labels_second = np.concatenate(all_inf_labels_second)
     inf_variance = np.concatenate(all_inf_variance)
     inf_uncertainty = np.concatenate(all_inf_uncertainty) if all_inf_uncertainty else None
     assert len(gt_points) == len(gt_labels) == len(inf_points) == len(inf_labels) == len(inf_variance)
-    assert len(inf_labels_second) == len(inf_labels)
 
     print("Building KD-tree on GT map...")
     tree = cKDTree(gt_points)
     print("Querying nearest GT neighbor for each inferred point...")
     _, nn_idx = tree.query(inf_points, k=1)
     gt_label_matched = gt_labels[nn_idx]
-    correct = (inf_labels == gt_label_matched)
+
+    # Mask to exclude ignored labels from accuracy metrics
+    ignore_set = set(IGNORE_LABELS)
+    valid = np.array([g not in ignore_set for g in gt_label_matched], dtype=bool)
+    n_ignored = int(np.sum(~valid))
+    print(f"Ignoring {n_ignored} points with GT label in {IGNORE_LABELS}")
+
+    correct_all = (inf_labels == gt_label_matched)
+    correct = correct_all[valid]
     n_correct = int(np.sum(correct))
     n_total = len(correct)
     print(f"Accuracy: {n_correct}/{n_total} ({100.0 * n_correct / n_total:.2f}%)")
@@ -582,58 +504,45 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
     max_var = (n_classes - 1) / (n_classes ** 2) if n_classes > 1 else 1.0
     scaled_var = np.clip(inf_variance / max_var, 0.0, 1.0)
     uncertainty_all = 1.0 - scaled_var
-    median_uncertainty = float(np.median(uncertainty_all))
+    uncertainty = uncertainty_all[valid]
+    median_uncertainty = float(np.median(uncertainty))
     print(f"Median uncertainty: {median_uncertainty:.6f}")
 
-    # Total accuracy of entire inferred map after switching above-median points to second-best label
-    modified_labels = np.where(uncertainty_all > median_uncertainty, inf_labels_second, inf_labels)
-    correct_modified = (modified_labels == gt_label_matched)
-    n_correct_modified = int(np.sum(correct_modified))
-    accuracy_modified = 100.0 * n_correct_modified / n_total
-    print(f"Total accuracy of entire inferred map (after switching to second-best for above-median): {n_correct_modified}/{n_total} ({accuracy_modified:.2f}%)")
-
-    if use_second_above_median:
-        n_above_median = int(np.sum(uncertainty_all > median_uncertainty))
-        print(f"Using second-highest class for points above median uncertainty: n={n_above_median} points switched")
-    else:
-        # Remove points with uncertainty > median; compute accuracy on remaining (low-uncertainty) points
-        low_uncertainty_mask = (uncertainty_all <= median_uncertainty)
-        n_kept = int(np.sum(low_uncertainty_mask))
-        n_removed = n_total - n_kept
-        correct_kept = correct[low_uncertainty_mask]
-        n_correct_kept = int(np.sum(correct_kept))
-        accuracy_kept = 100.0 * n_correct_kept / n_kept if n_kept > 0 else 0.0
-        print(f"Keeping points with uncertainty <= median: n={n_kept} (removed {n_removed} high-uncertainty points)")
-        print(f"Accuracy (inferred map after removing high-uncertainty points): {n_correct_kept}/{n_kept} ({accuracy_kept:.2f}%)")
+    low_mask = (uncertainty <= median_uncertainty)
+    n_kept = int(np.sum(low_mask))
+    n_removed = n_total - n_kept
+    n_correct_kept = int(np.sum(correct[low_mask]))
+    accuracy_kept = 100.0 * n_correct_kept / n_kept if n_kept > 0 else 0.0
+    print(f"Keeping points with uncertainty <= median: n={n_kept} (removed {n_removed} high-uncertainty points)")
+    print(f"Accuracy after removing high-uncertainty points: {n_correct_kept}/{n_kept} ({accuracy_kept:.2f}%)")
 
     # --- Uncertainty calibration: is the model's uncertainty predictive of errors? ---
-    incorrect = np.asarray(~correct, dtype=np.float64)  # 1 = wrong, 0 = correct
-    rho, p_val = spearmanr(uncertainty_all, incorrect)
+    incorrect = np.asarray(~correct, dtype=np.float64)
+    rho, p_val = spearmanr(uncertainty, incorrect)
     print(f"\n--- Uncertainty calibration ---")
-    print(f"Spearman(uncertainty, incorrect): ρ = {rho:.4f} (p = {p_val:.2e})")
-    print(f"  → Positive ρ means higher uncertainty correlates with more errors (good).")
+    print(f"Spearman(uncertainty, incorrect): rho = {rho:.4f} (p = {p_val:.2e})")
 
     # AUROC: can uncertainty discriminate correct vs incorrect? (1 = perfect, 0.5 = random)
     n_incorrect = int(np.sum(incorrect))
     n_correct_count = n_total - n_incorrect
     if n_incorrect > 0 and n_correct_count > 0:
-        ranks = rankdata(uncertainty_all)  # rank 1 = lowest uncertainty
+        ranks = rankdata(uncertainty)
         S = np.sum(ranks[~correct])
         auroc = (S - n_incorrect * (n_incorrect + 1) / 2) / (n_incorrect * n_correct_count)
-        print(f"AUROC(uncertainty → predicts error): {auroc:.4f} (1 = perfect, 0.5 = no better than random)")
+        print(f"AUROC(uncertainty -> predicts error): {auroc:.4f}")
     else:
         auroc = None
 
     # Accuracy by uncertainty bin (well-calibrated = accuracy decreases as uncertainty increases)
     n_bins = 10
-    bin_edges = np.percentile(uncertainty_all, np.linspace(0, 100, n_bins + 1))
-    bin_edges[-1] += 1e-9  # include max
+    bin_edges = np.percentile(uncertainty, np.linspace(0, 100, n_bins + 1))
+    bin_edges[-1] += 1e-9
     print(f"\nAccuracy by uncertainty bin (lower bin = more confident):")
     bin_accs = []
     bin_centers = []
     for i in range(n_bins):
         lo, hi = bin_edges[i], bin_edges[i + 1]
-        b = (uncertainty_all >= lo) & (uncertainty_all < hi)
+        b = (uncertainty >= lo) & (uncertainty < hi)
         n_b = int(np.sum(b))
         if n_b > 0:
             acc_b = 100.0 * np.sum(correct[b]) / n_b
@@ -641,12 +550,11 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
             bin_centers.append((lo + hi) / 2)
             print(f"  bin {i+1:2d} [unc {lo:.3f}-{hi:.3f}]: acc = {acc_b:.1f}%  (n={n_b})")
     if bin_accs:
-        # Plot: accuracy vs mean uncertainty per bin (well-calibrated = decreasing)
         fig_cal, ax_cal = plt.subplots(figsize=(7, 4))
         ax_cal.plot(bin_centers, bin_accs, "o-", color="steelblue", linewidth=2, markersize=8)
         ax_cal.set_xlabel("Mean uncertainty (bin)")
         ax_cal.set_ylabel("Accuracy (%)")
-        ax_cal.set_title("Accuracy by uncertainty bin (well-calibrated model: curve decreases)")
+        ax_cal.set_title("Accuracy by uncertainty bin")
         ax_cal.set_ylim(0, 105)
         ax_cal.grid(True, alpha=0.3)
         fig_cal.tight_layout()
@@ -654,11 +562,11 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
         plt.close(fig_cal)
 
     if view_mode == "correct":
-        mask = correct
+        mask = correct_all
     elif view_mode == "incorrect":
-        mask = ~correct
+        mask = ~correct_all
     else:
-        mask = np.ones(len(correct), dtype=bool)
+        mask = np.ones(len(correct_all), dtype=bool)
     n_show = int(np.sum(mask))
     print(f"Showing {n_show} points (view={view_mode})")
     avg_var = float(np.mean(inf_variance[mask]))
@@ -694,7 +602,7 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
 
     # -- Drive path (also used to set OSM z-offset) -----------------------
     if with_path or with_osm:
-        path_xyz = build_path_from_poses(poses_dict, index_to_timestamp)
+        path_xyz = build_path_from_poses(poses)
         if path_xyz is not None and len(path_xyz) >= 2:
             path_z_default = float(np.median(path_xyz[:, 2]))
             if with_path:
@@ -711,7 +619,7 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
         osm_file = get_mcd_osm_path(dataset_path)
         if os.path.isfile(osm_file):
             print(f"Loading OSM: {osm_file}")
-            loader = OSMLoader(osm_file, origin_latlon=tuple(ORIGIN_LATLON))
+            loader = OSMLoader(osm_file, origin_latlon=MCD_ORIGIN_LATLON)
             osm_geoms = loader.get_geometries(
                 z_offset=path_z_default, thickness=osm_thickness, buildings_only=not osm_all,
             )
@@ -735,21 +643,27 @@ def compare_gt_inferred_map(dataset_path, seq_name, label_config,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description="Compare GT labels vs inferred (dominant class): build maps, match via KD-tree, show accuracy. "
-                    "Option to view all / correct / incorrect inferred points."
+        description="Visualize MCD semantic map with Open3D. Default: one-hot GT labels. "
+                    "With --use-multiclass: compare GT vs inferred, show accuracy and uncertainty analysis."
     )
-    parser.add_argument("--dataset-path", type=str, default="./example_data/mcd")
+    parser.add_argument("--dataset-path", type=str,
+                        default=os.path.join(OSMBKI_ROOT, "example_data", "mcd"))
     parser.add_argument("--seq", type=str, nargs="+", default=["kth_day_09"], help="Sequence name(s)")
-    parser.add_argument("--view", type=str, choices=["all", "correct", "incorrect"], default="all",
-                        help="Show all inferred points, only correct, or only incorrect (default: all)")
     parser.add_argument("--max-scans", type=int, default=10000, help="Max scans to process (0 or None for all)")
     parser.add_argument("--downsample-factor", type=int, default=1, help="Process every Nth scan")
     parser.add_argument("--voxel-size", type=float, default=0.5, help="Voxel size in meters (per-scan downsampling)")
     parser.add_argument("--max-distance", type=float, default=200.0, help="Max distance from pose to keep points (m)")
-    parser.add_argument("--config", type=str, default=None, help="Path to MCD label config YAML (default: ce_net/config/data_cfg_mcd.yaml)")
-    parser.add_argument("--variance", action="store_true", help="Color by variance of class probabilities (Viridis: yellow=uncertain, dark=confident)")
-    parser.add_argument("--use-second-above-median", action="store_true",
-                        help="For points with uncertainty above median, use second-highest class instead of removing; report accuracy on all points")
+    parser.add_argument("--config", type=str, default=None, help="Path to MCD label config YAML (default: labels_mcd.yaml)")
+    parser.add_argument("--calib", type=str, default=None,
+                        help=f"Path to calibration YAML (default: <dataset-path>/hhs_calib.yaml)")
+    parser.add_argument("--inferred-labels", type=str, choices=list(INFERRED_LABEL_CONFIGS.keys()), default="semkitti",
+                        help="Inference network label set (default: semkitti)")
+    parser.add_argument("--use-multiclass", action="store_true",
+                        help="Load multiclass confidence scores instead of one-hot labels; enables accuracy analysis")
+    parser.add_argument("--variance", action="store_true",
+                        help="Color by variance of class probabilities (Viridis: yellow=uncertain, dark=confident)")
+    parser.add_argument("--view", type=str, choices=["all", "correct", "incorrect"], default="all",
+                        help="When using multiclass: show all / correct / incorrect points (default: all)")
     # OSM overlay arguments
     parser.add_argument("--with-osm", action="store_true", help="Overlay OSM map on the semantic map")
     parser.add_argument("--osm-thickness", type=float, default=2.0, help="OSM line thickness in meters (default: 2.0)")
@@ -758,28 +672,59 @@ if __name__ == '__main__':
     parser.add_argument("--path-thickness", type=float, default=1.5, help="Path line thickness in meters (default: 1.5)")
     args = parser.parse_args()
 
-    config_path = args.config or DEFAULT_CONFIG_PATH
-    if not os.path.exists(config_path):
-        print(f"ERROR: Config not found: {config_path}")
-        sys.exit(1)
-    label_config = load_label_config(config_path)
-
     max_scans = args.max_scans if args.max_scans else None
-    for seq_name in args.seq:
-        compare_gt_inferred_map(
-            args.dataset_path,
-            seq_name,
-            label_config,
-            max_scans=max_scans,
-            downsample_factor=args.downsample_factor,
-            voxel_size=args.voxel_size,
-            max_distance=args.max_distance,
-            view_mode=args.view,
-            view_variance=args.variance,
-            use_second_above_median=args.use_second_above_median,
-            with_osm=args.with_osm,
-            osm_thickness=args.osm_thickness,
-            osm_all=args.osm_all,
-            with_path=args.with_path,
-            path_thickness=args.path_thickness,
-        )
+
+    calib_path = args.calib or os.path.join(args.dataset_path, "hhs_calib.yaml")
+    if not os.path.exists(calib_path):
+        print(f"ERROR: Calibration file not found: {calib_path}")
+        sys.exit(1)
+    body_to_lidar_tf = load_body_to_lidar_tf(calib_path)
+    print(f"Loaded body-to-LiDAR transform from {calib_path}")
+
+    if args.use_multiclass:
+        config_path = args.config or DEFAULT_CONFIG_PATH
+        if not os.path.exists(config_path):
+            print(f"ERROR: Config not found: {config_path}")
+            sys.exit(1)
+        label_config = load_label_config(config_path)
+
+        inf_label_config_path = INFERRED_LABEL_CONFIGS[args.inferred_labels]
+        inf_label_config = load_label_config(inf_label_config_path)
+        inf_learning_map_inv = inf_label_config["learning_map_inv"]
+
+        for seq_name in args.seq:
+            compare_gt_inferred_map(
+                args.dataset_path,
+                seq_name,
+                label_config,
+                body_to_lidar_tf,
+                labels_key=args.inferred_labels,
+                inf_learning_map_inv=inf_learning_map_inv,
+                max_scans=max_scans,
+                downsample_factor=args.downsample_factor,
+                voxel_size=args.voxel_size,
+                max_distance=args.max_distance,
+                view_mode=args.view,
+                view_variance=args.variance,
+                with_osm=args.with_osm,
+                osm_thickness=args.osm_thickness,
+                osm_all=args.osm_all,
+                with_path=args.with_path,
+                path_thickness=args.path_thickness,
+            )
+    else:
+        for seq_name in args.seq:
+            build_semantic_map_mcd(
+                args.dataset_path,
+                seq_name,
+                body_to_lidar_tf,
+                max_scans=max_scans,
+                downsample_factor=args.downsample_factor,
+                voxel_size=args.voxel_size,
+                max_distance=args.max_distance,
+                with_osm=args.with_osm,
+                osm_thickness=args.osm_thickness,
+                osm_all=args.osm_all,
+                with_path=args.with_path,
+                path_thickness=args.path_thickness,
+            )

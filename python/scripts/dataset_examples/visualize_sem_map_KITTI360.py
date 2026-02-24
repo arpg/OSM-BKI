@@ -30,108 +30,7 @@ from scipy.stats import rankdata, spearmanr
 import matplotlib.pyplot as plt
 
 from utils import *
-from label_mappings import build_to_common_lut, apply_common_lut, common_labels_to_colors
-
-# Default paths
-KITTI360_ROOT = "./example_data/kitti360"
-DEFAULT_SEQUENCE = 9  # first sequence (2013_05_28_drive_0000_sync)
-
-# KITTI-360 Karlsruhe origin for lat/lon -> meters (same as Lidar2OSM)
-ORIGIN_LATLON = (48.9843445, 8.4295857)
-
-# Label set options: pick via --labels (e.g. --labels kitti360)
-Label = __import__("collections").namedtuple("Label", ["name", "id", "color"])
-
-# KITTI-360 labels 0-46 from kitti360_labels.yaml (colors in RGB)
-_KITTI360_NAMES = {
-    0: "unlabeled", 1: "ego vehicle", 2: "rectification border", 3: "out of roi",
-    4: "static", 5: "dynamic", 6: "ground", 7: "road", 8: "sidewalk", 9: "parking",
-    10: "rail track", 11: "building", 12: "wall", 13: "fence", 14: "guard rail",
-    15: "bridge", 16: "tunnel", 17: "pole", 18: "polegroup", 19: "traffic light",
-    20: "traffic sign", 21: "vegetation", 22: "terrain", 23: "sky", 24: "person",
-    25: "rider", 26: "car", 27: "truck", 28: "bus", 29: "caravan", 30: "trailer",
-    31: "train", 32: "motorcycle", 33: "bicycle", 34: "garage", 35: "gate",
-    36: "stop", 37: "smallpole", 38: "lamp", 39: "trash bin", 40: "vending machine",
-    41: "box", 42: "unknown construction", 43: "unknown vehicle", 44: "unknown object",
-    45: "OSM Building", 46: "OSM Road",
-}
-# RGB [R, G, B] per label (converted from yaml BGR)
-_KITTI360_COLORS_RGB = [
-    [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 74, 111], [81, 0, 81],
-    [128, 64, 128], [232, 35, 244], [160, 170, 250], [140, 150, 230], [0, 100, 0],
-    [156, 102, 102], [153, 153, 190], [180, 165, 180], [100, 100, 150], [90, 120, 150],
-    [153, 153, 153], [153, 153, 153], [30, 170, 250], [0, 220, 220], [35, 142, 107],
-    [152, 251, 152], [180, 130, 70], [60, 20, 220], [0, 0, 255], [142, 0, 0], [70, 0, 0],
-    [100, 60, 0], [90, 0, 0], [110, 0, 0], [100, 80, 0], [230, 0, 0], [32, 11, 119],
-    [128, 128, 64], [153, 153, 190], [90, 120, 150], [153, 153, 153], [64, 64, 0],
-    [192, 128, 0], [0, 64, 128], [128, 64, 64], [0, 0, 102], [51, 0, 51], [32, 32, 32],
-    [255, 255, 255], [255, 0, 0],
-]
-KITTI360_LABELS = [
-    Label(_KITTI360_NAMES[i], i, tuple(_KITTI360_COLORS_RGB[i]))
-    for i in range(47)
-]
-
-# Semantic KITTI-style sparse IDs (subset used in some pipelines)
-SEMKITTI_LABELS = [
-    Label("unlabeled", 0, (0, 0, 0)),
-    Label("outlier", 1, (0, 0, 0)),
-    Label("car", 10, (0, 0, 142)),
-    Label("bicycle", 11, (119, 11, 32)),
-    Label("bus", 13, (250, 80, 100)),
-    Label("motorcycle", 15, (0, 0, 230)),
-    Label("on-rails", 16, (255, 0, 0)),
-    Label("truck", 18, (0, 0, 70)),
-    Label("other-vehicle", 20, (51, 0, 51)),
-    Label("person", 30, (220, 20, 60)),
-    Label("bicyclist", 31, (200, 40, 255)),
-    Label("motorcyclist", 32, (90, 30, 150)),
-    Label("road", 40, (128, 64, 128)),
-    Label("parking", 44, (250, 170, 160)),
-    Label("sidewalk", 48, (244, 35, 232)),
-    Label("other-ground", 49, (81, 0, 81)),
-    Label("building", 50, (0, 100, 0)),
-    Label("fence", 51, (190, 153, 153)),
-    Label("other-structure", 52, (0, 150, 255)),
-    Label("lane-marking", 60, (170, 255, 150)),
-    Label("vegetation", 70, (107, 142, 35)),
-    Label("trunk", 71, (0, 60, 135)),
-    Label("terrain", 72, (152, 251, 152)),
-    Label("pole", 80, (153, 153, 153)),
-    Label("traffic-sign", 81, (0, 0, 255)),
-    Label("other-object", 99, (255, 255, 50)),
-]
-
-# Dict of label-set options for --labels
-LABELS_OPTIONS = {
-    "kitti360": KITTI360_LABELS,
-    "semkitti": SEMKITTI_LABELS,
-}
-
-
-def get_label_id_to_color(labels_list):
-    """Build id -> RGB [0,1] map from a list of Label(name, id, color)."""
-    return {lb.id: np.array(lb.color, dtype=np.float64) / 255.0 for lb in labels_list}
-
-
-# Default: use KITTI360_LABELS (overridden in main() when --labels is set)
-LABEL_ID_TO_COLOR = get_label_id_to_color(KITTI360_LABELS)
-# Default color for unknown label IDs (gray)
-UNKNOWN_COLOR = np.array([0.5, 0.5, 0.5], dtype=np.float64)
-
-# ---------------------------------------------------------------------------
-# Label config + multiclass helpers
-# ---------------------------------------------------------------------------
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-LABEL_CONFIG_PATHS = {
-    "kitti360": os.path.join(_SCRIPT_DIR, "labels_kitti360.yaml"),
-    "semkitti": os.path.join(_SCRIPT_DIR, "labels_semkitti.yaml"),
-}
-INFERRED_SUBDIRS = {
-    "kitti360": "cenet_kitti360",
-    "semkitti": "cenet_semkitti",
-}
-
+from label_mappings import build_to_common_lut, apply_common_lut, common_labels_to_colors, IGNORE_LABELS
 
 def load_label_config(config_path):
     """Load learning_map and learning_map_inv from a label YAML config."""
@@ -183,56 +82,14 @@ def read_poses(poses_path):
 
 
 def get_velodyne_poses(kitti360_root, sequence_dir):
-    """
-    Load Velodyne poses; if velodyne_poses.txt missing, derive from poses.txt (IMU) + calibration.
-    Tries new layout first (root/<seq>/velodyne_poses.txt or root/<seq>/poses/), then
-    old layout (root/data_poses/<seq>/).
-    """
-    # New layout: poses inside sequence dir
-    seq_dir_full = os.path.join(kitti360_root, sequence_dir)
-    for poses_dir in (seq_dir_full, os.path.join(seq_dir_full, "poses")):
-        velodyne_file = os.path.join(poses_dir, "velodyne_poses.txt")
-        imu_file = os.path.join(poses_dir, "poses.txt")
-        if os.path.exists(velodyne_file):
-            poses = read_poses(velodyne_file)
-            if not poses:
-                raise ValueError(
-                    f"velodyne_poses.txt at {velodyne_file} is empty or has no valid lines "
-                    "(expected: frame_id then 16 or 12 floats per line). "
-                    "If you trimmed scans with keep_lidar_limit.py, ensure some poses were kept."
-                )
-            return poses
-        if os.path.exists(imu_file):
-            translation = np.array([0.81, 0.32, -0.83])
-            rotation = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-            imu_to_lidar = np.eye(4)
-            imu_to_lidar[:3, :3] = rotation
-            imu_to_lidar[:3, 3] = translation
-            imu_poses = read_poses(imu_file)
-            if imu_poses:
-                return {idx: imu_T @ imu_to_lidar for idx, imu_T in imu_poses.items()}
-    # Old layout: data_poses/<seq>/
-    data_poses_dir = os.path.join(kitti360_root, "data_poses", sequence_dir)
-    velodyne_file = os.path.join(data_poses_dir, "velodyne_poses.txt")
-    imu_file = os.path.join(data_poses_dir, "poses.txt")
-    if os.path.exists(velodyne_file):
-        poses = read_poses(velodyne_file)
-        if not poses:
-            raise ValueError(
-                f"velodyne_poses.txt at {velodyne_file} is empty or has no valid lines."
-            )
-        return poses
-    if not os.path.exists(imu_file):
-        raise FileNotFoundError(
-            f"No poses found. Tried: {seq_dir_full}, {os.path.join(seq_dir_full, 'poses')}, {data_poses_dir}"
-        )
-    translation = np.array([0.81, 0.32, -0.83])
-    rotation = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-    imu_to_lidar = np.eye(4)
-    imu_to_lidar[:3, :3] = rotation
-    imu_to_lidar[:3, 3] = translation
-    imu_poses = read_poses(imu_file)
-    return {idx: imu_T @ imu_to_lidar for idx, imu_T in imu_poses.items()}
+    """Load Velodyne poses from root/<seq>/velodyne_poses.txt."""
+    velodyne_file = os.path.join(kitti360_root, sequence_dir, "velodyne_poses.txt")
+    if not os.path.exists(velodyne_file):
+        raise FileNotFoundError(f"velodyne_poses.txt not found: {velodyne_file}")
+    poses = read_poses(velodyne_file)
+    if not poses:
+        raise ValueError(f"velodyne_poses.txt is empty or has no valid lines: {velodyne_file}")
+    return poses
 
 
 def transform_points_to_world(points_xyz, pose_4x4):
@@ -242,58 +99,16 @@ def transform_points_to_world(points_xyz, pose_4x4):
     return (xyz_h @ pose_4x4.T)[:, :3]
 
 
-def labels_to_colors(label_ids):
-    """Map (N,) label IDs to (N, 3) RGB in [0, 1]."""
-    colors = np.zeros((len(label_ids), 3), dtype=np.float64)
-    for i, lid in enumerate(label_ids):
-        lid = int(lid)
-        if lid in LABEL_ID_TO_COLOR:
-            colors[i] = LABEL_ID_TO_COLOR[lid]
-        else:
-            colors[i] = UNKNOWN_COLOR
-    return colors
-
 
 def get_sequence_paths(kitti360_root, sequence_index):
-    """
-    Return paths for a given sequence index (e.g. 0 -> 2013_05_28_drive_0000_sync).
-    Supports:
-    - New layout: root/<seq>/velodyne_points/data, root/<seq>/gt_labels or root/<seq>/inferred_labels/cenet_semkitti
-    - Old layout: root/data_3d_raw/<seq>/velodyne_points/data, root/data_3d_semantics/<seq>/gt_labels (or orig_labels/labels)
-    """
+    """Return paths for a given sequence index (e.g. 0 -> 2013_05_28_drive_0000_sync)."""
     seq_dir = f"2013_05_28_drive_{sequence_index:04d}_sync"
-    # New layout: sequences directly under root
-    raw_pc_new = os.path.join(kitti360_root, seq_dir, "velodyne_points", "data")
-    gt_labels_new = os.path.join(kitti360_root, seq_dir, "gt_labels")
-    inferred_new = os.path.join(kitti360_root, seq_dir, "inferred_labels", "cenet_kitti360")
-    if os.path.isdir(raw_pc_new):
-        if os.path.isdir(gt_labels_new):
-            label_dir = gt_labels_new
-        elif os.path.isdir(inferred_new):
-            label_dir = inferred_new
-        else:
-            label_dir = gt_labels_new
-        return {
-            "sequence_dir": seq_dir,
-            "raw_pc_dir": raw_pc_new,
-            "label_dir": label_dir,
-        }
-    # Old layout: data_3d_raw, data_3d_semantics
-    raw_pc_dir = os.path.join(kitti360_root, "data_3d_raw", seq_dir, "velodyne_points", "data")
-    semantics_dir = os.path.join(kitti360_root, "data_3d_semantics", seq_dir)
-    for sub in ("gt_labels", "labels", "orig_labels"):
-        candidate = os.path.join(semantics_dir, sub)
-        if os.path.isdir(candidate):
-            return {
-                "sequence_dir": seq_dir,
-                "raw_pc_dir": raw_pc_dir,
-                "label_dir": candidate,
-            }
-    label_dir = os.path.join(semantics_dir, "gt_labels")
+    raw_pc_dir = os.path.join(kitti360_root, seq_dir, "velodyne_points", "data")
+    gt_labels_dir = os.path.join(kitti360_root, seq_dir, "gt_labels")
     return {
         "sequence_dir": seq_dir,
         "raw_pc_dir": raw_pc_dir,
-        "label_dir": label_dir,
+        "label_dir": gt_labels_dir,
     }
 
 
@@ -389,10 +204,7 @@ def build_semantic_map(
             world_xyz = world_xyz[mask]
             labels = labels[mask]
 
-        if gt_common_lut is not None:
-            colors = common_labels_to_colors(apply_common_lut(labels, gt_common_lut))
-        else:
-            colors = labels_to_colors(labels)
+        colors = common_labels_to_colors(apply_common_lut(labels, gt_common_lut))
 
         if voxel_size is not None and voxel_size > 0:
             pcd = o3d.geometry.PointCloud()
@@ -437,24 +249,16 @@ def build_multiclass_map(
     Load scans, GT labels, and multiclass confidence scores for one sequence.
     GT labels are mapped to common taxonomy via gt_common_lut (KITTI360 raw IDs).
     Inferred labels are mapped via learning_map_inv then inf_common_lut.
-    Returns dict with points, gt_labels, inf_labels, inf_labels_second (all in
-    common taxonomy IDs), inf_variance, and optionally inf_uncertainty.
+    Returns dict with points, gt_labels, inf_labels (all in common taxonomy IDs),
+    inf_variance, and optionally inf_uncertainty.
     """
     seq_dir = f"2013_05_28_drive_{sequence_index:04d}_sync"
     paths = get_sequence_paths(kitti360_root, sequence_index)
     raw_pc_dir = paths["raw_pc_dir"]
 
     infer_subdir = INFERRED_SUBDIRS.get(labels_key, f"cenet_{labels_key}")
-
-    # Resolve GT label dir
     gt_label_dir = os.path.join(kitti360_root, seq_dir, "gt_labels")
-    if not os.path.isdir(gt_label_dir):
-        gt_label_dir = os.path.join(kitti360_root, "data_3d_semantics", seq_dir, "gt_labels")
-
-    # Resolve multiclass confidence scores dir
     multiclass_dir = os.path.join(kitti360_root, seq_dir, "inferred_labels", infer_subdir, "multiclass_confidence_scores")
-    if not os.path.isdir(multiclass_dir):
-        multiclass_dir = os.path.join(kitti360_root, "data_3d_semantics", seq_dir, "inferred_labels", infer_subdir, "multiclass_confidence_scores")
 
     if not os.path.isdir(raw_pc_dir):
         raise FileNotFoundError(f"Raw LiDAR directory not found: {raw_pc_dir}")
@@ -482,7 +286,6 @@ def build_multiclass_map(
     all_points = []
     all_gt_labels = []
     all_inf_labels = []
-    all_inf_labels_second = []
     all_inf_variance = []
     all_inf_uncertainty = []
 
@@ -518,9 +321,6 @@ def build_multiclass_map(
         class_indices = np.argmax(multiclass_probs, axis=1)
         inf_lbl_raw = map_class_indices_to_labels(class_indices, learning_map_inv) if learning_map_inv else class_indices
         inf_lbl = apply_common_lut(inf_lbl_raw, inf_common_lut) if inf_common_lut is not None else inf_lbl_raw
-        second_class_indices = np.argsort(multiclass_probs, axis=1)[:, -2]
-        inf_lbl_second_raw = map_class_indices_to_labels(second_class_indices, learning_map_inv) if learning_map_inv else second_class_indices
-        inf_lbl_second = apply_common_lut(inf_lbl_second_raw, inf_common_lut) if inf_common_lut is not None else inf_lbl_second_raw
 
         variances = np.var(multiclass_probs.astype(np.float32), axis=1)
         if view_variance:
@@ -538,7 +338,6 @@ def build_multiclass_map(
             world_xyz = world_xyz[mask]
             gt_lbl_mapped = gt_lbl_mapped[mask]
             inf_lbl = inf_lbl[mask]
-            inf_lbl_second = inf_lbl_second[mask]
             variances = variances[mask]
             if uncertainty is not None:
                 uncertainty = uncertainty[mask]
@@ -554,7 +353,6 @@ def build_multiclass_map(
             _, idx = tree_scan.query(world_ds, k=1)
             gt_lbl_mapped = gt_lbl_mapped[idx]
             inf_lbl = inf_lbl[idx]
-            inf_lbl_second = inf_lbl_second[idx]
             variances = variances[idx]
             if uncertainty is not None:
                 uncertainty = uncertainty[idx]
@@ -568,7 +366,6 @@ def build_multiclass_map(
             world_xyz = world_xyz[:need]
             gt_lbl_mapped = gt_lbl_mapped[:need]
             inf_lbl = inf_lbl[:need]
-            inf_lbl_second = inf_lbl_second[:need]
             variances = variances[:need]
             if uncertainty is not None:
                 uncertainty = uncertainty[:need]
@@ -576,7 +373,6 @@ def build_multiclass_map(
         all_points.append(world_xyz.astype(np.float64))
         all_gt_labels.append(gt_lbl_mapped)
         all_inf_labels.append(inf_lbl)
-        all_inf_labels_second.append(inf_lbl_second)
         all_inf_variance.append(variances)
         if view_variance and uncertainty is not None:
             all_inf_uncertainty.append(uncertainty)
@@ -588,22 +384,27 @@ def build_multiclass_map(
         "points": np.vstack(all_points),
         "gt_labels": np.concatenate(all_gt_labels),
         "inf_labels": np.concatenate(all_inf_labels),
-        "inf_labels_second": np.concatenate(all_inf_labels_second),
         "inf_variance": np.concatenate(all_inf_variance),
         "inf_uncertainty": np.concatenate(all_inf_uncertainty) if all_inf_uncertainty else None,
         "n_classes": n_classes,
     }
 
 
-def run_accuracy_analysis(result, use_second_above_median=False):
-    """Run accuracy analysis, uncertainty calibration, and print reports. Returns (correct, uncertainty_all)."""
+def run_accuracy_analysis(result):
+    """Run accuracy analysis, uncertainty calibration, and print reports. Returns (correct, uncertainty_all) over ALL points (including ignored)."""
     gt_labels = result["gt_labels"]
     inf_labels = result["inf_labels"]
-    inf_labels_second = result["inf_labels_second"]
     inf_variance = result["inf_variance"]
     n_classes = result["n_classes"]
 
-    correct = (inf_labels == gt_labels)
+    # Mask to exclude ignored labels from accuracy metrics
+    ignore_set = set(IGNORE_LABELS)
+    valid = np.array([g not in ignore_set for g in gt_labels], dtype=bool)
+    n_ignored = int(np.sum(~valid))
+    print(f"Ignoring {n_ignored} points with GT label in {IGNORE_LABELS}")
+
+    correct_all = (inf_labels == gt_labels)
+    correct = correct_all[valid]
     n_correct = int(np.sum(correct))
     n_total = len(correct)
     print(f"Accuracy: {n_correct}/{n_total} ({100.0 * n_correct / n_total:.2f}%)")
@@ -611,49 +412,40 @@ def run_accuracy_analysis(result, use_second_above_median=False):
     max_var = (n_classes - 1) / (n_classes ** 2) if n_classes > 1 else 1.0
     scaled_var = np.clip(inf_variance / max_var, 0.0, 1.0)
     uncertainty_all = 1.0 - scaled_var
-    median_uncertainty = float(np.median(uncertainty_all))
+    uncertainty = uncertainty_all[valid]
+    median_uncertainty = float(np.median(uncertainty))
     print(f"Median uncertainty: {median_uncertainty:.6f}")
 
-    modified_labels = np.where(uncertainty_all > median_uncertainty, inf_labels_second, inf_labels)
-    correct_modified = (modified_labels == gt_labels)
-    n_correct_modified = int(np.sum(correct_modified))
-    accuracy_modified = 100.0 * n_correct_modified / n_total
-    print(f"Total accuracy after switching to second-best for above-median: {n_correct_modified}/{n_total} ({accuracy_modified:.2f}%)")
-
-    if use_second_above_median:
-        n_above = int(np.sum(uncertainty_all > median_uncertainty))
-        print(f"Using second-highest class for points above median uncertainty: n={n_above} points switched")
-    else:
-        low_mask = (uncertainty_all <= median_uncertainty)
-        n_kept = int(np.sum(low_mask))
-        n_removed = n_total - n_kept
-        n_correct_kept = int(np.sum(correct[low_mask]))
-        accuracy_kept = 100.0 * n_correct_kept / n_kept if n_kept > 0 else 0.0
-        print(f"Keeping points with uncertainty <= median: n={n_kept} (removed {n_removed})")
-        print(f"Accuracy after removing high-uncertainty points: {n_correct_kept}/{n_kept} ({accuracy_kept:.2f}%)")
+    low_mask = (uncertainty <= median_uncertainty)
+    n_kept = int(np.sum(low_mask))
+    n_removed = n_total - n_kept
+    n_correct_kept = int(np.sum(correct[low_mask]))
+    accuracy_kept = 100.0 * n_correct_kept / n_kept if n_kept > 0 else 0.0
+    print(f"Keeping points with uncertainty <= median: n={n_kept} (removed {n_removed})")
+    print(f"Accuracy after removing high-uncertainty points: {n_correct_kept}/{n_kept} ({accuracy_kept:.2f}%)")
 
     incorrect = np.asarray(~correct, dtype=np.float64)
-    rho, p_val = spearmanr(uncertainty_all, incorrect)
+    rho, p_val = spearmanr(uncertainty, incorrect)
     print(f"\n--- Uncertainty calibration ---")
     print(f"Spearman(uncertainty, incorrect): rho = {rho:.4f} (p = {p_val:.2e})")
 
     n_incorrect = int(np.sum(incorrect))
     n_correct_count = n_total - n_incorrect
     if n_incorrect > 0 and n_correct_count > 0:
-        ranks = rankdata(uncertainty_all)
+        ranks = rankdata(uncertainty)
         S = np.sum(ranks[~correct])
         auroc = (S - n_incorrect * (n_incorrect + 1) / 2) / (n_incorrect * n_correct_count)
         print(f"AUROC(uncertainty -> predicts error): {auroc:.4f}")
 
     n_bins = 10
-    bin_edges = np.percentile(uncertainty_all, np.linspace(0, 100, n_bins + 1))
+    bin_edges = np.percentile(uncertainty, np.linspace(0, 100, n_bins + 1))
     bin_edges[-1] += 1e-9
     print(f"\nAccuracy by uncertainty bin (lower bin = more confident):")
     bin_accs = []
     bin_centers = []
     for i in range(n_bins):
         lo, hi = bin_edges[i], bin_edges[i + 1]
-        b = (uncertainty_all >= lo) & (uncertainty_all < hi)
+        b = (uncertainty >= lo) & (uncertainty < hi)
         n_b = int(np.sum(b))
         if n_b > 0:
             acc_b = 100.0 * np.sum(correct[b]) / n_b
@@ -672,10 +464,10 @@ def run_accuracy_analysis(result, use_second_above_median=False):
         plt.show(block=True)
         plt.close(fig_cal)
 
-    var_all = inf_variance
-    avg_var = float(np.mean(var_all))
+    var_valid = inf_variance[valid]
+    avg_var = float(np.mean(var_valid))
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.hist(var_all, bins=80, color="steelblue", edgecolor="white", alpha=0.85)
+    ax.hist(var_valid, bins=80, color="steelblue", edgecolor="white", alpha=0.85)
     ax.axvline(avg_var, color="coral", linewidth=2, label=f"Mean = {avg_var:.4f}")
     ax.set_xlabel("Variance of class probabilities")
     ax.set_ylabel("Count")
@@ -685,7 +477,7 @@ def run_accuracy_analysis(result, use_second_above_median=False):
     plt.show(block=True)
     plt.close(fig)
 
-    return correct, uncertainty_all
+    return correct_all, uncertainty_all
 
 
 # ---------------------------------------------------------------------------
@@ -693,18 +485,9 @@ def run_accuracy_analysis(result, use_second_above_median=False):
 # ---------------------------------------------------------------------------
 
 def get_osm_path(kitti360_root, sequence_index):
-    """
-    Path to OSM file. Tries new layout first (root/kitti360.osm), then old layout
-    (data_osm/kitti360.osm or data_osm/map_<seq>.osm).
-    """
-    root_kitti360 = os.path.join(kitti360_root, "kitti360.osm")
-    if os.path.isfile(root_kitti360):
-        return root_kitti360
+    """Return path to OSM file: root/<seq>/map_XXXX.osm."""
     seq_dir = f"2013_05_28_drive_{sequence_index:04d}_sync"
-    seq_osm = os.path.join(kitti360_root, seq_dir, f"map_{sequence_index:04d}.osm")
-    if os.path.isfile(seq_osm):
-        return seq_osm
-    return root_kitti360
+    return os.path.join(kitti360_root, seq_dir, f"map_{sequence_index:04d}.osm")
 
 
 def get_path_from_velodyne_poses(kitti360_root, sequence_index):
@@ -734,14 +517,13 @@ def main():
     parser.add_argument(
         "--root",
         type=str,
-        default=KITTI360_ROOT,
-        help=f"KITTI360 dataset root (default: {KITTI360_ROOT})",
+        default=os.path.join(OSMBKI_ROOT, "example_data", "kitti360"),
     )
     parser.add_argument(
         "--sequence",
         type=int,
-        default=DEFAULT_SEQUENCE,
-        help=f"Sequence index, e.g. 0 -> 2013_05_28_drive_0000_sync (default: {DEFAULT_SEQUENCE})",
+        default=9,
+        help=f"Sequence index, e.g. 0 -> 2013_05_28_drive_0000_sync (default: 9)",
     )
     parser.add_argument(
         "--scan-skip",
@@ -768,17 +550,11 @@ def main():
         help="Stop accumulating once total points reach this limit (default: none)",
     )
     parser.add_argument(
-        "--save",
+        "--inferred-labels",
         type=str,
-        default=None,
-        help="Optional path to save point cloud as .ply",
-    )
-    parser.add_argument(
-        "--labels",
-        type=str,
-        default="kitti360",
-        choices=list(LABELS_OPTIONS.keys()),
-        help="Label set to use for coloring (default: kitti360). Options: %(choices)s",
+        default="semkitti",
+        choices=list(INFERRED_LABEL_CONFIGS.keys()),
+        help="Inference network label set (default: kitti360). Options: %(choices)s",
     )
     # Multiclass / accuracy arguments
     parser.add_argument("--use-multiclass", action="store_true",
@@ -787,8 +563,6 @@ def main():
                         help="Color by variance of class probabilities (Viridis: yellow=uncertain, dark=confident)")
     parser.add_argument("--view", type=str, choices=["all", "correct", "incorrect"], default="all",
                         help="When using multiclass: show all / correct / incorrect points (default: all)")
-    parser.add_argument("--use-second-above-median", action="store_true",
-                        help="For points with uncertainty above median, use second-highest class instead of removing")
     # OSM overlay arguments
     parser.add_argument("--with-osm", action="store_true", help="Overlay OSM map on the semantic map")
     parser.add_argument("--osm-thickness", type=float, default=2.0, help="OSM line thickness in meters (default: 2.0)")
@@ -801,7 +575,7 @@ def main():
 
     # Build common taxonomy LUTs
     gt_common_lut = build_to_common_lut("kitti360")
-    inf_common_lut = build_to_common_lut(args.labels)
+    inf_common_lut = build_to_common_lut(args.inferred_labels)
 
     print(f"KITTI360 root: {args.root}")
     print(f"Sequence index: {args.sequence}")
@@ -828,7 +602,7 @@ def main():
         osm_file = get_osm_path(args.root, args.sequence)
         if os.path.isfile(osm_file):
             print(f"Loading OSM: {osm_file}")
-            loader = OSMLoader(osm_file, origin_latlon=ORIGIN_LATLON)
+            loader = OSMLoader(osm_file, origin_latlon=KITTI360_ORIGIN_LATLON)
             osm_geoms = loader.get_geometries(
                 z_offset=path_z_default, thickness=args.osm_thickness, buildings_only=not args.osm_all,
             )
@@ -847,9 +621,9 @@ def main():
     # -- Build map --------------------------------------------------------
     if args.use_multiclass:
         # Load label config for learning_map / learning_map_inv
-        config_path = LABEL_CONFIG_PATHS.get(args.labels)
+        config_path = INFERRED_LABEL_CONFIGS.get(args.inferred_labels)
         if config_path is None or not os.path.isfile(config_path):
-            print(f"ERROR: Label config not found for '{args.labels}': {config_path}", file=sys.stderr)
+            print(f"ERROR: Label config not found for '{args.inferred_labels}': {config_path}", file=sys.stderr)
             sys.exit(1)
         label_cfg = load_label_config(config_path)
 
@@ -857,7 +631,7 @@ def main():
         result = build_multiclass_map(
             args.root,
             sequence_index=args.sequence,
-            labels_key=args.labels,
+            labels_key=args.inferred_labels,
             learning_map_inv=label_cfg["learning_map_inv"],
             gt_common_lut=gt_common_lut,
             inf_common_lut=inf_common_lut,
@@ -879,7 +653,7 @@ def main():
         print(f"Total points: {n_total}")
 
         # Accuracy analysis
-        correct, uncertainty_all = run_accuracy_analysis(result, use_second_above_median=args.use_second_above_median)
+        correct, uncertainty_all = run_accuracy_analysis(result)
 
         # Filter by view mode
         if args.view == "correct":
@@ -907,13 +681,6 @@ def main():
         pcd.colors = o3d.utility.Vector3dVector(colors)
         geoms.insert(0, pcd)
 
-        if args.save:
-            out_dir = os.path.dirname(os.path.abspath(args.save))
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-            o3d.io.write_point_cloud(args.save, pcd)
-            print(f"Saved to {args.save}")
-
     else:
         # Default: one-hot label mode
         print("Building semantic map...")
@@ -936,13 +703,6 @@ def main():
             pcd.points = o3d.utility.Vector3dVector(points)
             pcd.colors = o3d.utility.Vector3dVector(colors)
             geoms.insert(0, pcd)
-
-            if args.save:
-                out_dir = os.path.dirname(os.path.abspath(args.save))
-                if out_dir:
-                    os.makedirs(out_dir, exist_ok=True)
-                o3d.io.write_point_cloud(args.save, pcd)
-                print(f"Saved to {args.save}")
         else:
             print("No semantic points loaded. Check paths and sequence.", file=sys.stderr)
 
