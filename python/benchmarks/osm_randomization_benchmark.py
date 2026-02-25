@@ -26,11 +26,13 @@ import osm_bki_cpp
 # Category mapping: load_osm_geometries returns by class (config osm_class_map order)
 _CLASS_TO_CATEGORY = {
     0: "roads",
-    1: "roads",   # parking -> merge into roads
-    2: "roads",   # sidewalks -> merge into roads
-    3: "grasslands",  # vegetation: grasslands, trees, wood
+    1: "roads",        # parking -> merge into roads
+    2: "roads",        # sidewalks -> merge into roads
+    3: "grasslands",   # vegetation: grasslands, trees, wood
     4: "buildings",
-    5: "grasslands",  # fences -> merge into grasslands
+    5: "grasslands",   # fences -> merge into grasslands
+    6: "grasslands",   # poles -> merge into grasslands
+    7: "grasslands",   # traffic_signs -> merge into grasslands
 }
 
 
@@ -132,7 +134,10 @@ def _get_osm_categories(config_path):
     """Load osm_categories from config YAML (order required by C++ loader)."""
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
-    return cfg.get("osm_categories", ["buildings", "roads", "grasslands", "trees", "wood"])
+    return cfg.get("osm_categories", [
+        "buildings", "roads", "sidewalks", "parking", "grasslands",
+        "trees", "wood", "fences", "poles", "traffic_signs", "barriers",
+    ])
 
 
 def save_osm_bin(data, output_file, config_path=None):
@@ -147,7 +152,10 @@ def save_osm_bin(data, output_file, config_path=None):
     if config_path and Path(config_path).exists():
         categories = _get_osm_categories(config_path)
     else:
-        categories = ["buildings", "roads", "grasslands", "trees", "wood"]
+        categories = [
+            "buildings", "roads", "sidewalks", "parking", "grasslands",
+            "trees", "wood", "fences", "poles", "traffic_signs", "barriers",
+        ]
     
     with open(output_file, "wb") as f:
         for cat in categories:
