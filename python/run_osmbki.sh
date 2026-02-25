@@ -35,7 +35,7 @@ python python/scripts/continuous_map_train_test.py \
     --max-scans 1000 \
     --test-fraction 1 \
     --map-state output.bki \
-    --prior-delta 0.1 \
+    --prior-delta 1 \
     --osm-prior-strength 0.01 \
     --seed-osm-prior true \
     --resolution 0.5 \
