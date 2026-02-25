@@ -33,8 +33,10 @@ import seaborn as sns
 from sklearn.metrics import confusion_matrix as sklearn_confusion_matrix
 
 from script_utils import (
-    load_body_to_lidar, load_poses_csv, transform_points_to_world,
-    load_scan, load_labels, find_label_file, get_frame_number, ConfigReader
+    load_body_to_lidar,
+    load_poses_csv, transform_points_to_world,
+    load_poses_mat4, transform_points_to_world_mat4,
+    load_scan, load_labels, find_label_file, get_frame_number, ConfigReader,
 )
 from label_utils import (
     detect_dataset, build_to_common_lut, apply_common_lut,
@@ -180,6 +182,65 @@ def save_per_class_csv(path, class_names, method_names, data_rows):
 
 
 # ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+
+def validate_inputs(args) -> int:
+    """
+    Check that all file/directory paths supplied via CLI are valid before any
+    expensive work begins.  Collects *all* problems and prints them together so
+    the user can fix everything in one edit.
+
+    Returns the number of errors found (0 = OK).
+    """
+    errors = []
+
+    def require_file(path, label):
+        if not path:
+            return
+        if not os.path.isfile(path):
+            errors.append(f"  {label}: file not found: {path}")
+
+    def require_dir(path, label):
+        if not path:
+            return
+        if not os.path.isdir(path):
+            errors.append(f"  {label}: directory not found: {path}")
+
+    def require_dir_nonempty(path, label, glob="*"):
+        if not path:
+            return
+        p = Path(path)
+        if not p.is_dir():
+            errors.append(f"  {label}: directory not found: {path}")
+            return
+        if not any(p.glob(glob)):
+            errors.append(f"  {label}: directory is empty (no '{glob}' files): {path}")
+
+    # Required files
+    require_file(args.osm,    "--osm")
+    require_file(args.config, "--config")
+
+    # Required directories (must exist and have content)
+    require_dir_nonempty(args.scan_dir,  "--scan-dir",  "*.bin")
+    require_dir(args.label_dir, "--label-dir")
+    require_dir(args.gt_dir,    "--gt-dir")
+
+    # Optional pose file
+    if args.pose:
+        require_file(args.pose, "--pose")
+
+    # Optional calibration file (only relevant for quat pose format)
+    if args.calib and getattr(args, "pose_format", "quat") != "mat4":
+        require_file(args.calib, "--calib")
+
+    if errors:
+        print("ERROR: invalid inputs — aborting before any processing:\n" +
+              "\n".join(errors), file=sys.stderr)
+    return len(errors)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -198,7 +259,10 @@ def main():
     parser.add_argument("--gt-dir",     required=True, help="Directory of ground-truth labels")
     parser.add_argument("--output-dir", default=default_output_dir,
                         help=f"Directory to write all results (default: $RUN_RESULTS_DIR or {default_output_dir})")
-    parser.add_argument("--pose",  default=None, help="CSV poses (num,t,x,y,z,qx,qy,qz,qw)")
+    parser.add_argument("--pose",  default=None, help="Pose file path")
+    parser.add_argument("--pose-format", choices=["quat", "mat4"], default="quat",
+                        help="Pose file format: 'quat' (default, CSV num,t,x,y,z,qx,qy,qz,qw) "
+                             "or 'mat4' (KITTI-360 velodyne_poses.txt, frame + 3x4/4x4 matrix)")
     parser.add_argument("--calib", default=None,
                         help="Path to body→LiDAR calibration YAML (hhs_calib.yaml). "
                              "If omitted, an identity transform is used (poses are already in LiDAR frame).")
@@ -224,6 +288,9 @@ def main():
     parser.add_argument("--osm_origin_lon", type=float, default=None)
     args = parser.parse_args()
 
+    if validate_inputs(args):
+        return 1
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {out_dir}")
@@ -234,9 +301,6 @@ def main():
     scan_dir  = Path(args.scan_dir)
     label_dir = Path(args.label_dir)
     scan_files = sorted(scan_dir.glob("*.bin"))
-    if not scan_files:
-        print(f"No .bin scans in {scan_dir}", file=sys.stderr)
-        return 1
 
     if args.max_scans is not None:
         if args.max_scans <= 0:
@@ -312,35 +376,43 @@ def main():
 
     poses = None
     body_to_lidar = None
+    pose_format = args.pose_format
     if args.pose:
-        if not os.path.exists(args.pose):
-            print(f"Pose file not found: {args.pose}", file=sys.stderr)
-            return 1
-        poses = load_poses_csv(args.pose)
-        if args.calib:
-            if not os.path.exists(args.calib):
-                print(f"Calibration file not found: {args.calib}", file=sys.stderr)
-                return 1
-            body_to_lidar = load_body_to_lidar(args.calib)
-            print(f"Loaded {len(poses)} poses from {args.pose} with calib {args.calib}")
+        if pose_format == "mat4":
+            poses = load_poses_mat4(args.pose)
+            print(f"Loaded {len(poses)} mat4 poses from {args.pose}")
+            if args.calib:
+                print("WARNING: --calib is ignored with --pose-format mat4 "
+                      "(pose already encodes LiDAR-to-world).", file=sys.stderr)
         else:
-            body_to_lidar = np.eye(4, dtype=np.float64)
-            print(f"Loaded {len(poses)} poses from {args.pose} (no calib — using identity body→LiDAR)")
+            poses = load_poses_csv(args.pose)
+            if args.calib:
+                body_to_lidar = load_body_to_lidar(args.calib)
+                print(f"Loaded {len(poses)} poses from {args.pose} with calib {args.calib}")
+            else:
+                body_to_lidar = np.eye(4, dtype=np.float64)
+                print(f"Loaded {len(poses)} poses from {args.pose} (no calib — using identity body→LiDAR)")
     else:
         print("No --pose; using scan coordinates as-is.")
 
-    for p, label in [("osm", args.osm), ("config", args.config)]:
-        if not os.path.exists(label):
-            print(f"{p} file not found: {label}", file=sys.stderr)
-            return 1
+    # -------------------------------------------------------------------------
+    # Build shared OSM context (loads OSM file + builds prior raster once for
+    # all 5 methods, instead of repeating the expensive raster build each time)
+    # -------------------------------------------------------------------------
+    print("\n--- Building OSM context (shared across all methods) ---")
+    osm_ctx = osm_bki_cpp.PyOSMContext(
+        osm_path=args.osm,
+        config_path=args.config,
+        prior_delta=args.prior_delta,
+        resolution=args.resolution,
+    )
 
     # -------------------------------------------------------------------------
     # Training
     # -------------------------------------------------------------------------
     def train_bki(use_semantic_kernel, use_spatial_kernel, seed_osm_prior, osm_fallback):
         bki = osm_bki_cpp.PyContinuousBKI(
-            osm_path=args.osm,
-            config_path=args.config,
+            ctx=osm_ctx,
             resolution=args.resolution,
             l_scale=args.l_scale,
             sigma_0=args.sigma_0,
@@ -366,8 +438,12 @@ def main():
                 points_xyz = points_xyz[:min_len]
                 labels = labels[:min_len]
             if poses is not None and frame is not None and frame in poses:
-                points_xyz = transform_points_to_world(
-                    points_xyz, poses[frame], body_to_lidar, init_rel_pos)
+                if pose_format == "mat4":
+                    points_xyz = transform_points_to_world_mat4(
+                        points_xyz, poses[frame], init_rel_pos)
+                else:
+                    points_xyz = transform_points_to_world(
+                        points_xyz, poses[frame], body_to_lidar, init_rel_pos)
             bki.update(apply_common_lut(labels, pred_lut).astype(np.uint32), points_xyz)
         return bki
 
@@ -411,8 +487,12 @@ def main():
 
         points_xyz, _ = load_scan(str(scan_path))
         if poses is not None and frame is not None and frame in poses:
-            points_xyz = transform_points_to_world(
-                points_xyz, poses[frame], body_to_lidar, init_rel_pos)
+            if pose_format == "mat4":
+                points_xyz = transform_points_to_world_mat4(
+                    points_xyz, poses[frame], init_rel_pos)
+            else:
+                points_xyz = transform_points_to_world(
+                    points_xyz, poses[frame], body_to_lidar, init_rel_pos)
 
         gt = apply_common_lut(load_labels(gt_path), gt_lut).astype(np.uint32)
 

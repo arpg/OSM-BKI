@@ -66,6 +66,13 @@ osm_class_map:
   buildings: 4
   fences: 5
 
+# GPS reference for Mercator projection of OSM features into the LiDAR world frame.
+# If omitted, the parser falls back to the <bounds> centroid in the OSM file,
+# which may be wrong if the OSM extract covers a different region.
+# These coordinates are for KITTI-360 sequence 0009 (Karlsruhe).
+osm_origin_lat: 48.985
+osm_origin_lon: 8.39295
+
 # OSM categories in binary file order
 osm_categories:
   - buildings

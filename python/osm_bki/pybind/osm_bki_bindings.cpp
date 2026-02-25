@@ -71,9 +71,36 @@ std::vector<Point3D> array_to_points(const py::buffer_info& pb) {
 }  // namespace
 
 
+// ---------------------------------------------------------------------------
+// PyOSMContext: pre-loads OSM data and builds the prior raster once.
+// Pass to PyContinuousBKI to skip the expensive raster build on each method.
+// ---------------------------------------------------------------------------
+class PyOSMContext {
+public:
+    Config config;
+    OSMData osm_data;
+    std::shared_ptr<const OSMPriorRaster> raster;
+
+    // prior_delta and resolution must match the BKI instances that consume this
+    // context, since they determine the raster geometry.
+    PyOSMContext(const std::string& osm_path,
+                 const std::string& config_path,
+                 float prior_delta = 5.0f,
+                 float resolution  = 0.1f)
+        : config(loadConfigFromYAML(config_path)),
+          osm_data(loadOSM(osm_path, config))
+    {
+        int K_prior = config.confusion_matrix.empty() ? 0
+                    : static_cast<int>(config.confusion_matrix[0].size());
+        raster = OSMPriorRaster::build(osm_data, K_prior, prior_delta, 1e-6f, resolution);
+    }
+};
+
+
 // --- PyContinuousBKI: matches the PyContinuousBKI class in bindings.pyx
 class PyContinuousBKI {
 public:
+    // Original constructor: loads OSM from disk and builds the raster internally.
     PyContinuousBKI(const std::string& osm_path,
                     const std::string& config_path,
                     float resolution = 0.1f,
@@ -94,6 +121,29 @@ public:
                resolution, l_scale, sigma_0, prior_delta, height_sigma,
                use_semantic_kernel, use_spatial_kernel, num_threads,
                alpha0, seed_osm_prior, osm_prior_strength, osm_fallback_in_infer) {}
+
+    // Context constructor: reuses the pre-built OSM data and raster from a
+    // PyOSMContext.  The raster build (often the slowest step) is skipped.
+    PyContinuousBKI(const PyOSMContext& ctx,
+                    float resolution = 0.1f,
+                    float l_scale = 0.3f,
+                    float sigma_0 = 1.0f,
+                    float prior_delta = 5.0f,
+                    float height_sigma = 0.3f,
+                    bool use_semantic_kernel = true,
+                    bool use_spatial_kernel = true,
+                    int num_threads = -1,
+                    float alpha0 = 1.0f,
+                    bool seed_osm_prior = false,
+                    float osm_prior_strength = 0.0f,
+                    bool osm_fallback_in_infer = true)
+        : config_(ctx.config),
+          osm_data_(ctx.osm_data),
+          bki_(config_, osm_data_,
+               resolution, l_scale, sigma_0, prior_delta, height_sigma,
+               use_semantic_kernel, use_spatial_kernel, num_threads,
+               alpha0, seed_osm_prior, osm_prior_strength, osm_fallback_in_infer,
+               ctx.raster) {}
 
     // Hard labels update: update(labels, points) — labels first, matching Cython arg order
     void update(py::array_t<uint32_t> labels, py::array_t<float> points) {
@@ -354,7 +404,77 @@ PYBIND11_MODULE(osm_bki_cpp, m) {
           "body_to_lidar: (4,4) float64 calibration matrix\n"
           "init_rel_pos: (3,) float64 or None -- subtracted from pose translation");
 
+    m.def("transform_scan_to_world_mat4",
+          [](py::array_t<float> points,
+             py::array_t<double> pose_mat,
+             py::object init_rel_pos_obj) -> py::array_t<float> {
+              py::buffer_info pb = points.request();
+              if (pb.ndim != 2 || pb.shape[1] < 3)
+                  throw std::runtime_error("points must be (N, 3+) float32");
+
+              py::buffer_info mb = pose_mat.request();
+              if (mb.ndim != 2 || mb.shape[1] != 4 ||
+                  (mb.shape[0] != 3 && mb.shape[0] != 4))
+                  throw std::runtime_error("pose_mat must be (3,4) or (4,4) float64");
+
+              // Build Transform4x4 from the matrix; last row defaults to [0,0,0,1]
+              continuous_bki::Transform4x4 T;
+              for (int i = 0; i < 16; ++i) T.m[i] = (i == 15) ? 1.0 : 0.0;
+              const double* md = static_cast<const double*>(mb.ptr);
+              py::ssize_t s0 = mb.strides[0] / static_cast<py::ssize_t>(sizeof(double));
+              py::ssize_t s1 = mb.strides[1] / static_cast<py::ssize_t>(sizeof(double));
+              int rows = static_cast<int>(mb.shape[0]);
+              for (int i = 0; i < rows; ++i)
+                  for (int j = 0; j < 4; ++j)
+                      T.m[i * 4 + j] = md[i * s0 + j * s1];
+
+              const double* irp = nullptr;
+              double irp_buf[3];
+              if (!init_rel_pos_obj.is_none()) {
+                  py::array_t<double> irp_arr = py::cast<py::array_t<double>>(init_rel_pos_obj);
+                  py::buffer_info ib = irp_arr.request();
+                  if (ib.ndim != 1 || ib.shape[0] < 3)
+                      throw std::runtime_error("init_rel_pos must be (3,) float64");
+                  const double* id = static_cast<const double*>(ib.ptr);
+                  irp_buf[0] = id[0]; irp_buf[1] = id[1]; irp_buf[2] = id[2];
+                  irp = irp_buf;
+              }
+
+              std::vector<continuous_bki::Point3D> pts = array_to_points(pb);
+              std::vector<continuous_bki::Point3D> out =
+                  continuous_bki::transformScanToWorldMat4(pts, T, irp);
+
+              size_t n = out.size();
+              py::array_t<float> result({(py::ssize_t)n, (py::ssize_t)3});
+              float* rp = static_cast<float*>(result.request().ptr);
+              for (size_t i = 0; i < n; ++i) {
+                  rp[i * 3 + 0] = out[i].x;
+                  rp[i * 3 + 1] = out[i].y;
+                  rp[i * 3 + 2] = out[i].z;
+              }
+              return result;
+          },
+          py::arg("points"),
+          py::arg("pose_mat"),
+          py::arg("init_rel_pos") = py::none(),
+          "Transform LiDAR points (N,3) float32 to world frame using a direct matrix pose.\n"
+          "pose_mat: (3,4) or (4,4) float64 lidar-to-world transform (e.g. KITTI-360 velodyne_poses.txt).\n"
+          "No body_to_lidar calibration is applied — use when the pose is already in LiDAR frame.\n"
+          "init_rel_pos: (3,) float64 or None -- subtracted from the pose translation column");
+
+    // PyOSMContext: parse OSM + config once, build the prior raster once,
+    // then pass to PyContinuousBKI(ctx=...) for all method instances.
+    py::class_<PyOSMContext>(m, "PyOSMContext")
+        .def(py::init<const std::string&, const std::string&, float, float>(),
+             py::arg("osm_path"),
+             py::arg("config_path"),
+             py::arg("prior_delta") = 5.0f,
+             py::arg("resolution")  = 0.1f,
+             "Load OSM data and pre-build the prior raster.\n"
+             "prior_delta and resolution must match the BKI instances that will use this context.");
+
     py::class_<PyContinuousBKI>(m, "PyContinuousBKI")
+        // Original string-based constructor (builds raster internally)
         .def(py::init<const std::string&, const std::string&,
                       float, float, float, float, float,
                       bool, bool, int,
@@ -373,6 +493,25 @@ PYBIND11_MODULE(osm_bki_cpp, m) {
              py::arg("seed_osm_prior") = false,
              py::arg("osm_prior_strength") = 0.0f,
              py::arg("osm_fallback_in_infer") = true)
+        // Context-based constructor: shares pre-built OSM data and raster
+        .def(py::init<const PyOSMContext&,
+                      float, float, float, float, float,
+                      bool, bool, int,
+                      float, bool, float, bool>(),
+             py::arg("ctx"),
+             py::arg("resolution") = 0.1f,
+             py::arg("l_scale") = 0.3f,
+             py::arg("sigma_0") = 1.0f,
+             py::arg("prior_delta") = 5.0f,
+             py::arg("height_sigma") = 0.3f,
+             py::arg("use_semantic_kernel") = true,
+             py::arg("use_spatial_kernel") = true,
+             py::arg("num_threads") = -1,
+             py::arg("alpha0") = 1.0f,
+             py::arg("seed_osm_prior") = false,
+             py::arg("osm_prior_strength") = 0.0f,
+             py::arg("osm_fallback_in_infer") = true,
+             "Construct using a pre-built PyOSMContext (skips OSM load and raster build).")
         .def("update", &PyContinuousBKI::update,
              py::arg("labels"), py::arg("points"),
              "Update BKI with hard labels and points.")

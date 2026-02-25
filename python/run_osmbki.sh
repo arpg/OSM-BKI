@@ -16,19 +16,18 @@ export RUN_RESULTS_DIR="${RUN_RESULTS_DIR:-./run_results}"
 # ---------------------------------------------------------------------------
 # Example data paths (relative to repo root)
 # ---------------------------------------------------------------------------
-MCD="example_data/mcd"
-DATA="$MCD/kth_day_06"
-SCAN_DIR="$DATA/lidar_bin/data"
-LABEL_DIR="$DATA/labels_predicted"
-GT_DIR="$DATA/gt_labels"
-OSM="$MCD/kth.osm"
-POSE="$DATA/pose_inW.csv"
-CONFIG="configs/mcd_config.yaml"
+MCD="example_data/kitti360/"
+DATA="$MCD/2013_05_28_drive_0009_sync/"
+SCAN_DIR="$DATA/velodyne_points/data/"
+LABEL_DIR="$DATA/inferred_labels/cenet_semkitti/"
+GT_DIR="$DATA/gt_labels/"
+OSM="$MCD/map_0009.osm"
+POSE="$DATA/velodyne_poses.txt"
+CONFIG="configs/kitti360_config.yaml"
 
 # Body→LiDAR calibration (optional).
 # Set CALIB to the path if your dataset has one; leave empty or unset to use
 # an identity transform (i.e. poses are already expressed in the LiDAR frame).
-CALIB="$MCD/hhs_calib.yaml"
 
 echo "Results will be written to: $RUN_RESULTS_DIR"
 
@@ -42,13 +41,13 @@ python python/scripts/continuous_map_train_test.py \
     --config "$CONFIG" \
     --osm "$OSM" \
     $CALIB_FLAG \
-    --init_rel_pos 64.393 66.483 38.514 \
-    --osm_origin_lat 59.348268650 \
-    --osm_origin_lon 18.073204280 \
     --scan-dir "$SCAN_DIR" \
     --label-dir "$LABEL_DIR" \
     --gt-dir "$GT_DIR" \
     --pose "$POSE" \
+    --pose-format mat4 \
+    --dataset-pred-type semkitti \
+    --dataset-gt-type kitti360 \
     --output-dir "$RUN_RESULTS_DIR" \
     --offset 1 \
     --max-scans 1000 \

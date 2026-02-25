@@ -74,21 +74,65 @@ float Polygon::distance(const Point2D& p) const {
 // OSM Prior Raster: precompute 2D prior field for O(1) bilinear lookup
 // =====================================================================
 
-void ContinuousBKI::OSMPriorRaster::build(const ContinuousBKI& bki, float res) {
-    K_prior = bki.K_prior_;
-    if (K_prior <= 0) {
-        width = height = 0;
-        return;
+// ---------------------------------------------------------------------------
+// Free helper: signed distance from (x,y) to the nearest feature of class_idx.
+// Negative == inside a polygon.  +50 if no features exist for that class.
+// ---------------------------------------------------------------------------
+
+float computeDistanceToClass(const OSMData& osm_data, float x, float y, int class_idx) {
+    Point2D p(x, y);
+    float min_dist = std::numeric_limits<float>::max();
+
+    auto it_geom = osm_data.geometries.find(class_idx);
+    if (it_geom != osm_data.geometries.end()) {
+        for (const auto& poly : it_geom->second) {
+            float dist_bbox_x = std::max(0.0f, std::max(poly.min_x - p.x, p.x - poly.max_x));
+            float dist_bbox_y = std::max(0.0f, std::max(poly.min_y - p.y, p.y - poly.max_y));
+            float dist_bbox_sq = dist_bbox_x * dist_bbox_x + dist_bbox_y * dist_bbox_y;
+            if (dist_bbox_sq > min_dist * min_dist) continue;
+
+            float dist = poly.distance(p);
+            if (poly.contains(p)) dist = -dist;
+            min_dist = std::min(min_dist, dist);
+        }
     }
 
-    // Compute bounding box from all OSM features
+    auto it_points = osm_data.point_features.find(class_idx);
+    if (it_points != osm_data.point_features.end()) {
+        for (const auto& pt : it_points->second) {
+            float dx = p.x - pt.x, dy = p.y - pt.y;
+            min_dist = std::min(min_dist, std::sqrt(dx*dx + dy*dy));
+        }
+    }
+
+    return (min_dist == std::numeric_limits<float>::max()) ? 50.0f : min_dist;
+}
+
+// ---------------------------------------------------------------------------
+// OSMPriorRaster static factory
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<OSMPriorRaster> OSMPriorRaster::build(
+        const OSMData& osm_data,
+        int K_prior_in,
+        float delta,
+        float epsilon,
+        float res)
+{
+    auto raster = std::make_shared<OSMPriorRaster>();
+    raster->K_prior = K_prior_in;
+
+    if (K_prior_in <= 0) {
+        return raster;
+    }
+
     float bb_min_x = std::numeric_limits<float>::max();
     float bb_max_x = -std::numeric_limits<float>::max();
     float bb_min_y = std::numeric_limits<float>::max();
     float bb_max_y = -std::numeric_limits<float>::max();
     bool has_data = false;
 
-    for (const auto& kv : bki.osm_data_.geometries) {
+    for (const auto& kv : osm_data.geometries) {
         for (const auto& poly : kv.second) {
             bb_min_x = std::min(bb_min_x, poly.min_x);
             bb_max_x = std::max(bb_max_x, poly.max_x);
@@ -97,7 +141,7 @@ void ContinuousBKI::OSMPriorRaster::build(const ContinuousBKI& bki, float res) {
             has_data = true;
         }
     }
-    for (const auto& kv : bki.osm_data_.point_features) {
+    for (const auto& kv : osm_data.point_features) {
         for (const auto& pt : kv.second) {
             bb_min_x = std::min(bb_min_x, pt.x);
             bb_max_x = std::max(bb_max_x, pt.x);
@@ -108,58 +152,56 @@ void ContinuousBKI::OSMPriorRaster::build(const ContinuousBKI& bki, float res) {
     }
 
     if (!has_data) {
-        width = height = 0;
-        return;
+        return raster;
     }
 
-    // Pad by sigmoid effective range so edge queries still get meaningful priors
-    float pad = bki.delta_ * 6.0f;
+    float pad = delta * 6.0f;
     bb_min_x -= pad; bb_max_x += pad;
     bb_min_y -= pad; bb_max_y += pad;
 
-    min_x = bb_min_x;
-    min_y = bb_min_y;
-    cell_size = res;
+    raster->min_x     = bb_min_x;
+    raster->min_y     = bb_min_y;
+    raster->cell_size = res;
 
     float extent_x = bb_max_x - bb_min_x;
     float extent_y = bb_max_y - bb_min_y;
-    width  = static_cast<int>(std::ceil(extent_x / cell_size)) + 1;
-    height = static_cast<int>(std::ceil(extent_y / cell_size)) + 1;
+    raster->width  = static_cast<int>(std::ceil(extent_x / res)) + 1;
+    raster->height = static_cast<int>(std::ceil(extent_y / res)) + 1;
 
-    data.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * static_cast<size_t>(K_prior));
+    const int W = raster->width, H = raster->height, K = K_prior_in;
+    raster->data.resize(static_cast<size_t>(W) * static_cast<size_t>(H) * static_cast<size_t>(K));
 
     #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 8)
     #endif
-    for (int iy = 0; iy < height; iy++) {
-        float y = min_y + (iy + 0.5f) * cell_size;
-        for (int ix = 0; ix < width; ix++) {
-            float x = min_x + (ix + 0.5f) * cell_size;
-            size_t base = (static_cast<size_t>(iy) * static_cast<size_t>(width)
-                         + static_cast<size_t>(ix)) * static_cast<size_t>(K_prior);
-
+    for (int iy = 0; iy < H; iy++) {
+        float y = raster->min_y + (iy + 0.5f) * res;
+        for (int ix = 0; ix < W; ix++) {
+            float x = raster->min_x + (ix + 0.5f) * res;
+            size_t base = (static_cast<size_t>(iy) * static_cast<size_t>(W)
+                         + static_cast<size_t>(ix)) * static_cast<size_t>(K);
             float sum = 0.0f;
-            for (int k = 0; k < K_prior; k++) {
-                float dist = bki.computeDistanceToClass(x, y, k);
-                float score = (dist <= 0.0f) ? 1.0f
-                            : (dist >= bki.delta_) ? 0.0f
-                            : 0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * dist / bki.delta_));
-                data[base + static_cast<size_t>(k)] = score;
+            for (int k = 0; k < K; k++) {
+                float dist  = computeDistanceToClass(osm_data, x, y, k);
+                float score = (dist <= 0.0f)   ? 1.0f
+                            : (dist >= delta)  ? 0.0f
+                            : 0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * dist / delta));
+                raster->data[base + static_cast<size_t>(k)] = score;
                 sum += score;
             }
-            if (sum > bki.epsilon_) {
-                for (int k = 0; k < K_prior; k++) {
-                    data[base + static_cast<size_t>(k)] /= sum;
-                }
+            if (sum > epsilon) {
+                for (int k = 0; k < K; k++)
+                    raster->data[base + static_cast<size_t>(k)] /= sum;
             }
         }
     }
 
-    std::cout << "OSM prior raster: " << width << "x" << height
-              << " (" << (width * height) << " cells at " << cell_size << "m resolution)" << std::endl;
+    std::cout << "OSM prior raster: " << W << "x" << H
+              << " (" << (W * H) << " cells at " << res << "m resolution)" << std::endl;
+    return raster;
 }
 
-void ContinuousBKI::OSMPriorRaster::lookup(float x, float y, std::vector<float>& m_i) const {
+void OSMPriorRaster::lookup(float x, float y, std::vector<float>& m_i) const {
     if (width <= 0 || height <= 0) return;
 
     float fx = (x - min_x) / cell_size - 0.5f;
@@ -209,7 +251,8 @@ ContinuousBKI::ContinuousBKI(const Config& config,
               float alpha0,
               bool seed_osm_prior,
               float osm_prior_strength,
-              bool osm_fallback_in_infer)
+              bool osm_fallback_in_infer,
+              std::shared_ptr<const OSMPriorRaster> shared_raster)
     : config_(config),
       osm_data_(osm_data),
       resolution_(resolution),
@@ -280,11 +323,16 @@ ContinuousBKI::ContinuousBKI(const Config& config,
         }
     }
 
-    auto t0_raster = std::chrono::high_resolution_clock::now();
-    osm_prior_raster_.build(*this, resolution_);
-    auto t1_raster = std::chrono::high_resolution_clock::now();
-    profiling_.raster_build_ms = std::chrono::duration<double, std::milli>(t1_raster - t0_raster).count();
-    std::cout << "[Profiling] OSM raster build: " << profiling_.raster_build_ms << " ms" << std::endl;
+    if (shared_raster) {
+        osm_prior_raster_ = shared_raster;
+        std::cout << "[Profiling] OSM raster build: 0 ms (reusing shared raster)" << std::endl;
+    } else {
+        auto t0_raster = std::chrono::high_resolution_clock::now();
+        osm_prior_raster_ = OSMPriorRaster::build(osm_data_, K_prior_, delta_, epsilon_, resolution_);
+        auto t1_raster = std::chrono::high_resolution_clock::now();
+        profiling_.raster_build_ms = std::chrono::duration<double, std::milli>(t1_raster - t0_raster).count();
+        std::cout << "[Profiling] OSM raster build: " << profiling_.raster_build_ms << " ms" << std::endl;
+    }
 }
 
 void ContinuousBKI::clear() {
@@ -435,43 +483,15 @@ float ContinuousBKI::computeSpatialKernel(float dist_sq) const {
 }
 
 float ContinuousBKI::computeDistanceToClass(float x, float y, int class_idx) const {
-    Point2D p(x, y);
-    float min_dist = std::numeric_limits<float>::max();
-
-    auto it_geom = osm_data_.geometries.find(class_idx);
-    if (it_geom != osm_data_.geometries.end()) {
-        for (const auto& poly : it_geom->second) {
-            float dist_bbox_x = std::max(0.0f, std::max(poly.min_x - p.x, p.x - poly.max_x));
-            float dist_bbox_y = std::max(0.0f, std::max(poly.min_y - p.y, p.y - poly.max_y));
-            float dist_bbox_sq = dist_bbox_x * dist_bbox_x + dist_bbox_y * dist_bbox_y;
-            if (dist_bbox_sq > min_dist * min_dist) continue;
-
-            float dist = poly.distance(p);
-            if (poly.contains(p)) dist = -dist;
-            min_dist = std::min(min_dist, dist);
-        }
-    }
-
-    auto it_points = osm_data_.point_features.find(class_idx);
-    if (it_points != osm_data_.point_features.end()) {
-        for (const auto& pt : it_points->second) {
-            float dx = p.x - pt.x;
-            float dy = p.y - pt.y;
-            float dist = std::sqrt(dx*dx + dy*dy);
-            min_dist = std::min(min_dist, dist);
-        }
-    }
-
-    if (min_dist == std::numeric_limits<float>::max()) return 50.0f;
-    return min_dist;
+    return continuous_bki::computeDistanceToClass(osm_data_, x, y, class_idx);
 }
 
 // getOSMPrior: uses precomputed raster when available, falls back to brute force
 void ContinuousBKI::getOSMPrior(float x, float y, std::vector<float>& m_i) const {
     if (m_i.size() != static_cast<size_t>(K_prior_)) m_i.resize(static_cast<size_t>(K_prior_));
 
-    if (osm_prior_raster_.width > 0) {
-        osm_prior_raster_.lookup(x, y, m_i);
+    if (osm_prior_raster_ && osm_prior_raster_->width > 0) {
+        osm_prior_raster_->lookup(x, y, m_i);
         return;
     }
 
