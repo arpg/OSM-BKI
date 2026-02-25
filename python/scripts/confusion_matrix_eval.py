@@ -9,7 +9,6 @@ Usage (matches run_cmd.sh parameters):
     python python/scripts/confusion_matrix_eval.py \\
         --config cpp/osm_bki/configs/mcd_config.yaml \\
         --osm example_data/kth.osm \\
-        --calib example_data/hhs_calib.yaml \\
         --scan-dir /path/to/lidar_bin/data/ \\
         --label-dir /path/to/inferred_labels/ \\
         --gt-dir /path/to/gt_labels/ \\
@@ -104,7 +103,9 @@ def main():
     )
     parser.add_argument("--config", required=True, help="Path to YAML config (e.g. mcd_config.yaml)")
     parser.add_argument("--osm", required=True, help="Path to OSM geometries (.bin or .osm)")
-    parser.add_argument("--calib", required=True, help="Path to hhs_calib.yaml (body→LiDAR)")
+    parser.add_argument("--calib", default=None,
+                        help="Path to body→LiDAR calibration YAML. "
+                             "If omitted, an identity transform is used.")
     parser.add_argument("--scan-dir", required=True, help="Directory of .bin scans")
     parser.add_argument("--label-dir", required=True, help="Directory of predicted labels (.label/.bin)")
     parser.add_argument("--gt-dir", required=True, help="Directory of ground-truth labels")
@@ -213,7 +214,14 @@ def main():
     print(f"GT labels:         dataset={gt_dataset}")
 
     poses = load_poses_csv(args.pose)
-    body_to_lidar = load_body_to_lidar(args.calib)
+    if args.calib:
+        if not os.path.exists(args.calib):
+            print(f"ERROR: Calibration file not found: {args.calib}", file=sys.stderr)
+            return 1
+        body_to_lidar = load_body_to_lidar(args.calib)
+    else:
+        body_to_lidar = np.eye(4, dtype=np.float64)
+        print("No --calib provided; using identity body→LiDAR transform.")
     init_rel_pos = np.array(args.init_rel_pos, dtype=np.float64) if args.init_rel_pos else None
 
     # Train BKI

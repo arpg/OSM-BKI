@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
 """
-Train a continuous BKI map on the first half of scans and evaluate on the second half.
+Train a continuous BKI map on training scans and evaluate on held-out scans.
 
-Uses the same LiDAR->Body->World transform as build_voxel_map.py when a pose file
-is provided, so all scans are in a common world frame. No pre-voxelization;
-points are transformed and passed directly to the BKI.
+Five methods are compared:
+  sem+osm     : semantic kernel + OSM prior seeding + OSM fallback
+  sem         : semantic kernel only (no OSM prior)
+  sbki+osm    : S-BKI (spatial kernel only) + OSM prior seeding + OSM fallback
+  sbki        : S-BKI (spatial kernel only, no OSM prior)
+  nokernels   : no kernels (label pass-through via BKI mean)
+Plus a 'baseline' result from the raw input prediction labels.
+
+All outputs are written to --output-dir (default: $RUN_RESULTS_DIR or ./run_results/):
+  {output_dir}/{method}.bki             - saved map state per method
+  {output_dir}/labels/{method}/         - per-scan predicted label files
+  {output_dir}/accuracy_per_class.csv   - per-class recall for every method
+  {output_dir}/iou_per_class.csv        - per-class IoU for every method
+  {output_dir}/confusion_matrix_{method}.png
 """
 
+import csv
 import os
 import sys
 import argparse
@@ -14,77 +26,212 @@ import numpy as np
 import osm_bki_cpp
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix as sklearn_confusion_matrix
+
 from script_utils import (
     load_body_to_lidar, load_poses_csv, transform_points_to_world,
     load_scan, load_labels, find_label_file, get_frame_number, ConfigReader
 )
 from label_utils import (
-    detect_dataset, build_to_common_lut, apply_common_lut, IGNORE_LABELS
+    detect_dataset, build_to_common_lut, apply_common_lut,
+    IGNORE_LABELS, COMMON_LABELS, N_COMMON,
 )
 
+# ---------------------------------------------------------------------------
+# Method definitions
+# ---------------------------------------------------------------------------
 
-def compute_metrics(pred, gt, ignore_label=0):
-    """Accuracy and mIoU; optionally ignore a label (e.g. 0) in GT."""
-    pred = np.asarray(pred, dtype=np.uint32)
-    gt = np.asarray(gt, dtype=np.uint32)
-    if pred.shape != gt.shape:
-        return {"accuracy": 0.0, "miou": 0.0, "class_ious": {}}
+METHODS = [
+    {
+        "name": "sem+osm",
+        "use_semantic_kernel": True,
+        "use_spatial_kernel": True,
+        "seed_osm_prior": True,
+        "osm_fallback": True,
+    },
+    {
+        "name": "sem",
+        "use_semantic_kernel": True,
+        "use_spatial_kernel": True,
+        "seed_osm_prior": False,
+        "osm_fallback": False,
+    },
+    {
+        "name": "sbki+osm",
+        "use_semantic_kernel": False,
+        "use_spatial_kernel": True,
+        "seed_osm_prior": True,
+        "osm_fallback": True,
+    },
+    {
+        "name": "sbki",
+        "use_semantic_kernel": False,
+        "use_spatial_kernel": True,
+        "seed_osm_prior": False,
+        "osm_fallback": False,
+    },
+    {
+        "name": "nokernels",
+        "use_semantic_kernel": False,
+        "use_spatial_kernel": False,
+        "seed_osm_prior": False,
+        "osm_fallback": False,
+    },
+]
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def compute_cm(pred, gt, n_classes, ignore_label=0):
+    """Return (n_classes × n_classes) confusion matrix, ignoring ignore_label in GT."""
+    pred = np.asarray(pred, dtype=np.int64)
+    gt = np.asarray(gt, dtype=np.int64)
     mask = gt != ignore_label
+    classes = list(range(n_classes))
     if not np.any(mask):
-        return {"accuracy": 0.0, "miou": 0.0, "class_ious": {}}
-    pred_m = pred[mask]
-    gt_m = gt[mask]
-    accuracy = np.mean(pred_m == gt_m)
-    classes = np.unique(np.concatenate([pred_m, gt_m]))
-    ious = {}
-    for c in classes:
-        inter = np.sum((pred_m == c) & (gt_m == c))
-        union = np.sum((pred_m == c) | (gt_m == c))
-        if union > 0:
-            ious[int(c)] = inter / union
-    miou = np.mean(list(ious.values())) if ious else 0.0
-    return {"accuracy": accuracy, "miou": miou, "class_ious": ious}
+        return np.zeros((n_classes, n_classes), dtype=np.int64)
+    return sklearn_confusion_matrix(gt[mask], pred[mask], labels=classes)
 
+
+def metrics_from_cm(cm):
+    """
+    Derive per-class accuracy (recall), per-class IoU, overall accuracy and mIoU
+    from an aggregated confusion matrix.
+
+    Returns dict with keys:
+      per_class_accuracy : ndarray (n_classes,)
+      per_class_iou      : ndarray (n_classes,)
+      accuracy           : float
+      miou               : float  (mean over valid classes)
+    """
+    n = cm.shape[0]
+    per_class_acc = np.zeros(n)
+    per_class_iou = np.zeros(n)
+
+    for c in range(n):
+        tp = cm[c, c]
+        fn = cm[c, :].sum() - tp
+        fp = cm[:, c].sum() - tp
+        row_sum = tp + fn
+        union = tp + fp + fn
+        per_class_acc[c] = tp / row_sum if row_sum > 0 else float("nan")
+        per_class_iou[c] = tp / union if union > 0 else float("nan")
+
+    total_correct = np.diag(cm).sum()
+    total_pts = cm.sum()
+    accuracy = total_correct / total_pts if total_pts > 0 else 0.0
+
+    valid_ious = per_class_iou[~np.isnan(per_class_iou)]
+    miou = float(np.mean(valid_ious)) if len(valid_ious) > 0 else 0.0
+
+    return {
+        "per_class_accuracy": per_class_acc,
+        "per_class_iou": per_class_iou,
+        "accuracy": accuracy,
+        "miou": miou,
+    }
+
+
+def plot_and_save_confusion_matrix(cm, class_names, path, title=None, normalize=True):
+    """Save a confusion matrix heatmap to *path*."""
+    if normalize:
+        row_sums = cm.sum(axis=1, keepdims=True)
+        cm_plot = np.where(row_sums > 0, cm.astype(float) / row_sums, 0.0)
+        fmt = ".2f"
+        cbar_label = "Recall (fraction)"
+    else:
+        cm_plot = cm
+        fmt = "d"
+        cbar_label = "Count"
+
+    fig, ax = plt.subplots(figsize=(14, 12))
+    sns.heatmap(
+        cm_plot, annot=True, fmt=fmt, cmap="Blues",
+        xticklabels=class_names, yticklabels=class_names,
+        ax=ax, cbar_kws={"label": cbar_label},
+        linewidths=0.5, linecolor="gray",
+    )
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Ground Truth")
+    ax.set_title(title or "Confusion Matrix")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def save_per_class_csv(path, class_names, method_names, data_rows):
+    """
+    Save a CSV where rows = classes, columns = [class_name, method1, method2, ...].
+
+    data_rows : list of length n_classes, each entry is a list of per-method values.
+    """
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["class"] + method_names)
+        for name, values in zip(class_names, data_rows):
+            row = [name] + [f"{v:.4f}" if not np.isnan(v) else "nan" for v in values]
+            writer.writerow(row)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
+    default_output_dir = os.environ.get("RUN_RESULTS_DIR", "./run_results")
+
     parser = argparse.ArgumentParser(
-        description="Train continuous BKI with offset-based scan subsampling and evaluate on held-out in-between scans."
+        description="Train continuous BKI and evaluate five methods against GT labels.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
-    parser.add_argument("--scan-dir", required=True, help="Directory of .bin scans")
-    parser.add_argument("--label-dir", required=True, help="Directory of prediction labels (.label or .bin)")
-    parser.add_argument("--osm", required=True, help="Path to OSM geometries (.bin or .osm XML)")
-    parser.add_argument("--config", required=True, help="Path to YAML config")
-    parser.add_argument("--pose", default=None, help="CSV poses (num,t,x,y,z,qx,qy,qz,qw) for world-frame transform (optional)")
-    parser.add_argument("--calib", default="example_data/hhs_calib.yaml", help="Path to hhs_calib.yaml (body→LiDAR calibration, body/os_sensor/T)")
-    parser.add_argument("--gt-dir", required=True, help="Directory of ground-truth labels for test half metrics")
+    parser.add_argument("--scan-dir",   required=True, help="Directory of .bin scans")
+    parser.add_argument("--label-dir",  required=True, help="Directory of prediction labels (.label or .bin)")
+    parser.add_argument("--osm",        required=True, help="Path to OSM geometries (.bin or .osm XML)")
+    parser.add_argument("--config",     required=True, help="Path to YAML config")
+    parser.add_argument("--gt-dir",     required=True, help="Directory of ground-truth labels")
+    parser.add_argument("--output-dir", default=default_output_dir,
+                        help=f"Directory to write all results (default: $RUN_RESULTS_DIR or {default_output_dir})")
+    parser.add_argument("--pose",  default=None, help="CSV poses (num,t,x,y,z,qx,qy,qz,qw)")
+    parser.add_argument("--calib", default=None,
+                        help="Path to body→LiDAR calibration YAML (hhs_calib.yaml). "
+                             "If omitted, an identity transform is used (poses are already in LiDAR frame).")
     parser.add_argument("--dataset-pred-type", choices=["mcd", "semkitti", "kitti360"], default=None,
                         help="Dataset type for prediction labels (overrides autodetect)")
-    parser.add_argument("--dataset-gt-type", choices=["mcd", "semkitti", "kitti360"], default=None,
+    parser.add_argument("--dataset-gt-type",   choices=["mcd", "semkitti", "kitti360"], default=None,
                         help="Dataset type for GT labels (overrides autodetect)")
-    parser.add_argument("--output-dir", default=None, help="Optional: save refined labels for test scans here")
-    parser.add_argument("--map-state", default=None, help="Optional: path to save trained map state")
-    parser.add_argument("--offset", type=int, default=1, help="Train on every Nth scan; use in-between scans for testing (N>=1)")
-    parser.add_argument("--test-fraction", type=float, default=1.0, help="Fraction of selected test scans to evaluate (0 < f <= 1)")
-    parser.add_argument("--max-scans", type=int, default=None, help="Optional cap on number of scans to use from the sorted list")
-    parser.add_argument("--resolution", type=float, default=1.0, help="BKI resolution")
-    parser.add_argument("--l-scale", type=float, default=3.0, help="BKI l_scale")
-    parser.add_argument("--sigma-0", type=float, default=1.0, help="BKI sigma_0")
-    parser.add_argument("--prior-delta", type=float, default=0.5, help="BKI prior_delta")
-    parser.add_argument("--height-sigma", type=float, default=5.0, help="BKI height_sigma (controls vertical spread of OSM prior)")
-    parser.add_argument("--alpha0", type=float, default=1.0, help="BKI alpha0")
-    parser.add_argument("--seed-osm-prior", type=bool, default=False, help="Enable OSM prior seeding")
-    parser.add_argument("--osm-prior-strength", type=float, default=0.0, help="OSM prior strength")
-    parser.add_argument("--disable-osm-fallback", type=bool, default=False, help="Disable OSM fallback during inference")
-    parser.add_argument("--init_rel_pos", type=float, nargs=3, metavar=('X', 'Y', 'Z'), default=None,
-                        help="World-frame initial position to subtract from poses "
-                             "(overrides init_rel_pos_day_06 in config YAML)")
-    parser.add_argument("--osm_origin_lat", type=float, default=None,
-                        help="Override OSM projection origin latitude (read from config YAML if not given)")
-    parser.add_argument("--osm_origin_lon", type=float, default=None,
-                        help="Override OSM projection origin longitude (read from config YAML if not given)")
+    parser.add_argument("--offset",        type=int,   default=1,   help="Train on every Nth scan (N>=1)")
+    parser.add_argument("--test-fraction", type=float, default=1.0, help="Fraction of test scans to evaluate (0,1]")
+    parser.add_argument("--max-scans",     type=int,   default=None, help="Cap on number of scans")
+    parser.add_argument("--resolution",    type=float, default=1.0)
+    parser.add_argument("--l-scale",       type=float, default=3.0)
+    parser.add_argument("--sigma-0",       type=float, default=1.0)
+    parser.add_argument("--prior-delta",   type=float, default=0.5)
+    parser.add_argument("--height-sigma",  type=float, default=5.0)
+    parser.add_argument("--alpha0",        type=float, default=1.0)
+    parser.add_argument("--osm-prior-strength", type=float, default=0.01,
+                        help="OSM prior strength used for all OSM-prior methods")
+    parser.add_argument("--disable-osm-fallback", action="store_true",
+                        help="Disable OSM fallback during inference for OSM-prior methods")
+    parser.add_argument("--init_rel_pos", type=float, nargs=3, metavar=("X", "Y", "Z"), default=None)
+    parser.add_argument("--osm_origin_lat", type=float, default=None)
+    parser.add_argument("--osm_origin_lon", type=float, default=None)
     args = parser.parse_args()
 
-    scan_dir = Path(args.scan_dir)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {out_dir}")
+
+    # -------------------------------------------------------------------------
+    # Scan list
+    # -------------------------------------------------------------------------
+    scan_dir  = Path(args.scan_dir)
     label_dir = Path(args.label_dir)
     scan_files = sorted(scan_dir.glob("*.bin"))
     if not scan_files:
@@ -95,8 +242,7 @@ def main():
         if args.max_scans <= 0:
             print("ERROR: --max-scans must be > 0", file=sys.stderr)
             return 1
-        if args.max_scans < len(scan_files):
-            scan_files = scan_files[:args.max_scans]
+        scan_files = scan_files[:args.max_scans]
 
     if args.offset < 1:
         print("ERROR: --offset must be >= 1", file=sys.stderr)
@@ -107,72 +253,50 @@ def main():
 
     n_total = len(scan_files)
     if args.offset == 1:
-        # Backward-compatible behavior: all scans contribute to map and are evaluated.
         train_files = scan_files
         candidate_test_files = scan_files
-        print(f"Scans: {n_total} total -> offset=1, using all scans for both training and testing")
+        print(f"Scans: {n_total} total -> offset=1, all scans for train+test")
     else:
         train_files = [f for i, f in enumerate(scan_files) if i % args.offset == 0]
         candidate_test_files = [f for i, f in enumerate(scan_files) if i % args.offset != 0]
         print(
             f"Scans: {n_total} total -> offset={args.offset}, "
-            f"training on {len(train_files)} scans (every {args.offset}th), "
-            f"testing candidate set has {len(candidate_test_files)} in-between scans"
+            f"train={len(train_files)}, test candidates={len(candidate_test_files)}"
         )
 
-    # Optionally downsample test scans using deterministic uniform index spacing.
     if candidate_test_files and args.test_fraction < 1.0:
-        n_candidates = len(candidate_test_files)
-        n_keep = max(1, int(np.ceil(n_candidates * args.test_fraction)))
-        keep_idxs = np.linspace(0, n_candidates - 1, n_keep, dtype=int)
-        test_files = [candidate_test_files[i] for i in keep_idxs]
+        n_keep = max(1, int(np.ceil(len(candidate_test_files) * args.test_fraction)))
+        idxs = np.linspace(0, len(candidate_test_files) - 1, n_keep, dtype=int)
+        test_files = [candidate_test_files[i] for i in idxs]
     else:
         test_files = candidate_test_files
 
-    print(
-        f"Final test split: {len(test_files)} / {len(candidate_test_files)} "
-        f"candidate scans (test_fraction={args.test_fraction:.3f})"
-    )
-    if n_total > 0:
-        pct_total = 100.0 * len(test_files) / n_total
-    else:
-        pct_total = 0.0
-    if len(candidate_test_files) > 0:
-        pct_candidates = 100.0 * len(test_files) / len(candidate_test_files)
-    else:
-        pct_candidates = 0.0
-    print(
-        f"Testing will run on {len(test_files)} scans "
-        f"({pct_total:.1f}% of total, {pct_candidates:.1f}% of candidate test set)."
-    )
+    print(f"Test scans: {len(test_files)} / {len(candidate_test_files)} candidates")
 
-    # --- Autodetect dataset type for pred and GT labels, build common-taxonomy LUTs ---
-    _first_pred_path = find_label_file(label_dir, scan_files[0].stem)
-    if _first_pred_path:
-        _sample = load_labels(_first_pred_path)
-        pred_dataset = args.dataset_pred_type or detect_dataset(_sample)
+    # -------------------------------------------------------------------------
+    # Autodetect dataset types + build LUTs
+    # -------------------------------------------------------------------------
+    _first_pred = find_label_file(label_dir, scan_files[0].stem)
+    if _first_pred:
+        pred_dataset = args.dataset_pred_type or detect_dataset(load_labels(_first_pred))
     else:
-        if args.dataset_pred_type is None:
-            print("WARNING: Could not find a prediction label file to autodetect dataset type; "
-                  "defaulting to 'mcd'. Use --dataset-pred-type to override.", file=sys.stderr)
         pred_dataset = args.dataset_pred_type or "mcd"
+        print("WARNING: could not find pred label for autodetect; using 'mcd'.", file=sys.stderr)
     pred_lut = build_to_common_lut(pred_dataset)
     print(f"Prediction labels: dataset={pred_dataset}")
 
-    gt_dir_path = Path(args.gt_dir)
-    _first_gt_path = find_label_file(args.gt_dir, scan_files[0].stem)
-    if _first_gt_path:
-        _sample_gt = load_labels(_first_gt_path)
-        gt_dataset = args.dataset_gt_type or detect_dataset(_sample_gt)
+    _first_gt = find_label_file(args.gt_dir, scan_files[0].stem)
+    if _first_gt:
+        gt_dataset = args.dataset_gt_type or detect_dataset(load_labels(_first_gt))
     else:
-        if args.dataset_gt_type is None:
-            print("WARNING: Could not find a GT label file to autodetect dataset type; "
-                  "defaulting to pred dataset. Use --dataset-gt-type to override.", file=sys.stderr)
         gt_dataset = args.dataset_gt_type or pred_dataset
+        print("WARNING: could not find GT label for autodetect; using pred dataset.", file=sys.stderr)
     gt_lut = build_to_common_lut(gt_dataset)
     print(f"GT labels:         dataset={gt_dataset}")
 
-    # Resolve init_rel_pos: CLI overrides config YAML's init_rel_pos_day_06
+    # -------------------------------------------------------------------------
+    # Poses / calibration
+    # -------------------------------------------------------------------------
     init_rel_pos = None
     if args.init_rel_pos is not None:
         init_rel_pos = np.array(args.init_rel_pos, dtype=np.float64)
@@ -182,9 +306,9 @@ def main():
             init_rel_pos = init_rel_pos.astype(np.float64)
 
     if init_rel_pos is not None:
-        print(f"init_rel_pos = [{init_rel_pos[0]:.4f}, {init_rel_pos[1]:.4f}, {init_rel_pos[2]:.4f}]")
+        print(f"init_rel_pos = {init_rel_pos.tolist()}")
     else:
-        print("No init_rel_pos; poses used as-is (no world-frame re-zeroing).")
+        print("No init_rel_pos; poses used as-is.")
 
     poses = None
     body_to_lidar = None
@@ -192,73 +316,28 @@ def main():
         if not os.path.exists(args.pose):
             print(f"Pose file not found: {args.pose}", file=sys.stderr)
             return 1
-        if not os.path.exists(args.calib):
-            print(f"Calibration file not found: {args.calib}", file=sys.stderr)
-            return 1
         poses = load_poses_csv(args.pose)
-        body_to_lidar = load_body_to_lidar(args.calib)
-        print(f"Loaded {len(poses)} poses; transforming scans to world frame using {args.calib}")
+        if args.calib:
+            if not os.path.exists(args.calib):
+                print(f"Calibration file not found: {args.calib}", file=sys.stderr)
+                return 1
+            body_to_lidar = load_body_to_lidar(args.calib)
+            print(f"Loaded {len(poses)} poses from {args.pose} with calib {args.calib}")
+        else:
+            body_to_lidar = np.eye(4, dtype=np.float64)
+            print(f"Loaded {len(poses)} poses from {args.pose} (no calib — using identity body→LiDAR)")
     else:
-        print("No --pose provided; using scan coordinates as-is (sensor frame).")
+        print("No --pose; using scan coordinates as-is.")
 
-    if not os.path.exists(args.osm):
-        print("OSM file must exist", file=sys.stderr)
-        return 1
-    if not (args.osm.endswith(".bin") or args.osm.endswith(".osm")):
-        print("OSM file must be .bin (binary) or .osm (XML format)", file=sys.stderr)
-        return 1
-    if not os.path.exists(args.config):
-        print("Config file not found", file=sys.stderr)
-        return 1
+    for p, label in [("osm", args.osm), ("config", args.config)]:
+        if not os.path.exists(label):
+            print(f"{p} file not found: {label}", file=sys.stderr)
+            return 1
 
-    def train_bki(use_semantic_kernel):
-        bki = osm_bki_cpp.PyContinuousBKI(
-            osm_path=args.osm,
-            config_path=args.config,
-            resolution=args.resolution,
-            l_scale=args.l_scale,
-            sigma_0=args.sigma_0,
-            prior_delta=args.prior_delta,
-            height_sigma=args.height_sigma,
-            use_semantic_kernel=use_semantic_kernel,
-            use_spatial_kernel=True,
-            alpha0=args.alpha0,
-            seed_osm_prior=args.seed_osm_prior,
-            osm_prior_strength=args.osm_prior_strength,
-            osm_fallback_in_infer=not args.disable_osm_fallback
-        )
-        for scan_path in train_files:
-            stem = scan_path.stem
-            frame = get_frame_number(stem)
-            label_path = find_label_file(label_dir, stem)
-            if not label_path:
-                continue
-            points_xyz, _ = load_scan(str(scan_path))
-            labels = load_labels(label_path)
-            if len(labels) != len(points_xyz):
-                min_len = min(len(labels), len(points_xyz))
-                points_xyz = points_xyz[:min_len]
-                labels = labels[:min_len]
-            if poses is not None and frame is not None and frame in poses:
-                points_xyz = transform_points_to_world(points_xyz, poses[frame], body_to_lidar, init_rel_pos)
-            labels_common = apply_common_lut(labels, pred_lut).astype(np.uint32)
-            bki.update(labels_common, points_xyz)
-        return bki
-
-    # Build maps: with semantic kernel, without semantic kernel, and without spatial kernel
-    print("\n--- Training (first half) ---")
-    print("  Training with semantic kernel...")
-    bki_sem = train_bki(use_semantic_kernel=True)
-    print(f"  Map size (with sem):  {bki_sem.get_size()} voxels")
-    
-    print("  Training without semantic kernel...")
-    bki_nosem = train_bki(use_semantic_kernel=False)
-    print(f"  Map size (without sem): {bki_nosem.get_size()} voxels")
-
-    print("  Training without BOTH kernels (no spatial, no semantic)...")
-    # To disable spatial kernel, we need to modify train_bki or create a new instance
-    # Let's modify train_bki to accept use_spatial_kernel
-    def train_bki_custom(use_semantic_kernel, use_spatial_kernel):
+    # -------------------------------------------------------------------------
+    # Training
+    # -------------------------------------------------------------------------
+    def train_bki(use_semantic_kernel, use_spatial_kernel, seed_osm_prior, osm_fallback):
         bki = osm_bki_cpp.PyContinuousBKI(
             osm_path=args.osm,
             config_path=args.config,
@@ -270,9 +349,9 @@ def main():
             use_semantic_kernel=use_semantic_kernel,
             use_spatial_kernel=use_spatial_kernel,
             alpha0=args.alpha0,
-            seed_osm_prior=args.seed_osm_prior,
-            osm_prior_strength=args.osm_prior_strength,
-            osm_fallback_in_infer=not args.disable_osm_fallback
+            seed_osm_prior=seed_osm_prior,
+            osm_prior_strength=args.osm_prior_strength if seed_osm_prior else 0.0,
+            osm_fallback_in_infer=osm_fallback and not args.disable_osm_fallback,
         )
         for scan_path in train_files:
             stem = scan_path.stem
@@ -287,102 +366,158 @@ def main():
                 points_xyz = points_xyz[:min_len]
                 labels = labels[:min_len]
             if poses is not None and frame is not None and frame in poses:
-                points_xyz = transform_points_to_world(points_xyz, poses[frame], body_to_lidar, init_rel_pos)
-            labels_common = apply_common_lut(labels, pred_lut).astype(np.uint32)
-            bki.update(labels_common, points_xyz)
+                points_xyz = transform_points_to_world(
+                    points_xyz, poses[frame], body_to_lidar, init_rel_pos)
+            bki.update(apply_common_lut(labels, pred_lut).astype(np.uint32), points_xyz)
         return bki
 
-    bki_nokernels = train_bki_custom(use_semantic_kernel=False, use_spatial_kernel=False)
-    print(f"  Map size (no kernels): {bki_nokernels.get_size()} voxels")
+    print("\n--- Training ---")
+    bki_maps = {}
+    for m in METHODS:
+        print(f"  Training '{m['name']}'...")
+        bki_maps[m["name"]] = train_bki(
+            use_semantic_kernel=m["use_semantic_kernel"],
+            use_spatial_kernel=m["use_spatial_kernel"],
+            seed_osm_prior=m["seed_osm_prior"],
+            osm_fallback=m["osm_fallback"],
+        )
+        size = bki_maps[m["name"]].get_size()
+        print(f"    Map size: {size} voxels")
+        save_path = out_dir / f"{m['name']}.bki"
+        bki_maps[m["name"]].save(str(save_path))
+        print(f"    Saved -> {save_path}")
 
-    if args.map_state:
-        base, ext = os.path.splitext(args.map_state)
-        os.makedirs(os.path.dirname(args.map_state) or ".", exist_ok=True)
-        bki_sem.save(base + "_sem" + (ext or ""))
-        bki_nosem.save(base + "_nosem" + (ext or ""))
-        bki_nokernels.save(base + "_nokernels" + (ext or ""))
-        print(f"  Saved maps to {base}_sem / {base}_nosem / {base}_nokernels")
+    # -------------------------------------------------------------------------
+    # Testing
+    # -------------------------------------------------------------------------
+    print("\n--- Testing ---")
 
-    # Evaluate on held-out scans selected by offset
-    print("\n--- Testing (offset holdout scans) ---")
-    all_metrics_sem = []
-    all_metrics_nosem = []
-    all_metrics_nokernels = []
-    all_metrics_baseline = []
-    
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
+    # Per-method accumulation of all pred + gt for aggregated CM
+    all_preds = {m["name"]: [] for m in METHODS}
+    all_preds["baseline"] = []
+    all_gts = []
 
+    labels_out_dir = out_dir / "labels"
+    for m in METHODS:
+        (labels_out_dir / m["name"]).mkdir(parents=True, exist_ok=True)
+
+    n_evaluated = 0
     for scan_path in test_files:
         stem = scan_path.stem
         frame = get_frame_number(stem)
+        gt_path = find_label_file(args.gt_dir, stem)
+        if not gt_path:
+            continue
+
         points_xyz, _ = load_scan(str(scan_path))
         if poses is not None and frame is not None and frame in poses:
-            points_xyz = transform_points_to_world(points_xyz, poses[frame], body_to_lidar, init_rel_pos)
+            points_xyz = transform_points_to_world(
+                points_xyz, poses[frame], body_to_lidar, init_rel_pos)
 
-        pred_sem = bki_sem.infer(points_xyz)
-        pred_nosem = bki_nosem.infer(points_xyz)
-        pred_nokernels = bki_nokernels.infer(points_xyz)
+        gt = apply_common_lut(load_labels(gt_path), gt_lut).astype(np.uint32)
 
-        if args.output_dir:
-            pred_sem.astype(np.uint32).tofile(str(Path(args.output_dir) / f"{stem}_refined_sem.label"))
-            pred_nosem.astype(np.uint32).tofile(str(Path(args.output_dir) / f"{stem}_refined_nosem.label"))
-            pred_nokernels.astype(np.uint32).tofile(str(Path(args.output_dir) / f"{stem}_refined_nokernels.label"))
+        preds_this = {}
+        for m in METHODS:
+            preds_this[m["name"]] = np.asarray(bki_maps[m["name"]].infer(points_xyz), dtype=np.uint32)
 
-        gt_path = find_label_file(args.gt_dir, stem)
-        if gt_path:
-            gt_raw = load_labels(gt_path)
-            gt = apply_common_lut(gt_raw, gt_lut).astype(np.uint32)
-
-            # Load baseline (input) labels and convert to common
-            input_path = find_label_file(label_dir, stem)
-            input_labels = None
-            if input_path:
-                input_labels = apply_common_lut(load_labels(input_path), pred_lut).astype(np.uint32)
-
-            # infer() already returns common IDs (BKI trained on common labels)
-            n = min(len(gt), len(pred_sem), len(pred_nosem), len(pred_nokernels))
-            if input_labels is not None:
-                n = min(n, len(input_labels))
-
-            if n > 0:
-                ignore = IGNORE_LABELS[0] if IGNORE_LABELS else 0
-                all_metrics_sem.append(compute_metrics(pred_sem[:n], gt[:n], ignore_label=ignore))
-                all_metrics_nosem.append(compute_metrics(pred_nosem[:n], gt[:n], ignore_label=ignore))
-                all_metrics_nokernels.append(compute_metrics(pred_nokernels[:n], gt[:n], ignore_label=ignore))
-                if input_labels is not None:
-                    all_metrics_baseline.append(compute_metrics(input_labels[:n], gt[:n], ignore_label=ignore))
-
-    if all_metrics_sem:
-        acc_sem = np.mean([m["accuracy"] for m in all_metrics_sem])
-        miou_sem = np.mean([m["miou"] for m in all_metrics_sem])
-        acc_nosem = np.mean([m["accuracy"] for m in all_metrics_nosem])
-        miou_nosem = np.mean([m["miou"] for m in all_metrics_nosem])
-        acc_nokernels = np.mean([m["accuracy"] for m in all_metrics_nokernels])
-        miou_nokernels = np.mean([m["miou"] for m in all_metrics_nokernels])
-        
-        print(f"  Test scans with GT: {len(all_metrics_sem)}")
-        if len(test_files) > 0:
-            pct_gt = 100.0 * len(all_metrics_sem) / len(test_files)
-        else:
-            pct_gt = 0.0
-        print(
-            f"  Evaluated {len(all_metrics_sem)} / {len(test_files)} selected test scans "
-            f"({pct_gt:.1f}% had matching GT)."
+        # Baseline: raw input labels converted to common
+        input_path = find_label_file(label_dir, stem)
+        baseline = (
+            apply_common_lut(load_labels(input_path), pred_lut).astype(np.uint32)
+            if input_path else None
         )
-        if all_metrics_baseline:
-            acc_base = np.mean([m["accuracy"] for m in all_metrics_baseline])
-            miou_base = np.mean([m["miou"] for m in all_metrics_baseline])
-            print("  Baseline (Input):        Accuracy {:.4f}  mIoU {:.4f}".format(acc_base, miou_base))
-        
-        print("  With semantic kernel:    Accuracy {:.4f}  mIoU {:.4f}".format(acc_sem, miou_sem))
-        print("  Without semantic kernel: Accuracy {:.4f}  mIoU {:.4f}".format(acc_nosem, miou_nosem))
-        print("  Without ANY kernels:     Accuracy {:.4f}  mIoU {:.4f}".format(acc_nokernels, miou_nokernels))
-    else:
-        if not test_files:
-            print("  No test scans selected by offset. Increase --offset to create holdout scans.")
-        else:
-            print("  No test scans had matching GT labels.")
+
+        n = len(gt)
+        for m in METHODS:
+            n = min(n, len(preds_this[m["name"]]))
+        if baseline is not None:
+            n = min(n, len(baseline))
+        if n == 0:
+            continue
+
+        all_gts.append(gt[:n])
+        for m in METHODS:
+            pred_arr = preds_this[m["name"]][:n]
+            all_preds[m["name"]].append(pred_arr)
+            pred_arr.tofile(str(labels_out_dir / m["name"] / f"{stem}.label"))
+
+        if baseline is not None:
+            all_preds["baseline"].append(baseline[:n])
+        n_evaluated += 1
+
+    print(f"  Evaluated {n_evaluated} / {len(test_files)} test scans with GT")
+
+    if not all_gts:
+        print("  No test scans had matching GT labels.")
+        print("\nDone.")
+        return 0
+
+    # -------------------------------------------------------------------------
+    # Aggregate metrics and save outputs
+    # -------------------------------------------------------------------------
+    gt_concat = np.concatenate(all_gts)
+    ignore = IGNORE_LABELS[0] if IGNORE_LABELS else 0
+
+    # Class names for CSV / CM axes (exclude unlabeled for display)
+    all_class_ids = list(range(N_COMMON))
+    class_names_all = [COMMON_LABELS[c] for c in all_class_ids]
+    # For CM plot: skip unlabeled (class 0)
+    cm_class_ids = [c for c in all_class_ids if c != ignore]
+    cm_class_names = [COMMON_LABELS[c] for c in cm_class_ids]
+
+    method_names_ordered = [m["name"] for m in METHODS] + ["baseline"]
+    acc_rows  = [[] for _ in all_class_ids]   # acc_rows[class_idx][method_idx]
+    iou_rows  = [[] for _ in all_class_ids]
+
+    summary_rows = []
+
+    print("\n--- Results ---")
+    for method_name in method_names_ordered:
+        preds_list = all_preds[method_name]
+        if not preds_list:
+            # baseline may be absent if no input labels found
+            for c_idx in range(N_COMMON):
+                acc_rows[c_idx].append(float("nan"))
+                iou_rows[c_idx].append(float("nan"))
+            summary_rows.append((method_name, float("nan"), float("nan")))
+            continue
+
+        pred_concat = np.concatenate(preds_list)
+        cm = compute_cm(pred_concat, gt_concat, N_COMMON, ignore_label=ignore)
+        mets = metrics_from_cm(cm)
+
+        for c_idx in range(N_COMMON):
+            acc_rows[c_idx].append(mets["per_class_accuracy"][c_idx])
+            iou_rows[c_idx].append(mets["per_class_iou"][c_idx])
+
+        summary_rows.append((method_name, mets["accuracy"], mets["miou"]))
+
+        # Confusion matrix (skip unlabeled row/col for readability)
+        cm_reduced = cm[np.ix_(cm_class_ids, cm_class_ids)]
+        cm_path = out_dir / f"confusion_matrix_{method_name}.png"
+        plot_and_save_confusion_matrix(
+            cm_reduced, cm_class_names, str(cm_path),
+            title=f"Confusion Matrix — {method_name}",
+            normalize=True,
+        )
+        print(f"  {method_name:<14}  Acc={mets['accuracy']:.4f}  mIoU={mets['miou']:.4f}"
+              f"  -> {cm_path.name}")
+
+    # Save CSVs
+    acc_csv = out_dir / "accuracy_per_class.csv"
+    iou_csv = out_dir / "iou_per_class.csv"
+    save_per_class_csv(acc_csv, class_names_all, method_names_ordered, acc_rows)
+    save_per_class_csv(iou_csv, class_names_all, method_names_ordered, iou_rows)
+    print(f"\n  Saved {acc_csv.name} and {iou_csv.name}")
+
+    # Summary table
+    print("\n  Summary:")
+    print(f"  {'Method':<14}  {'Accuracy':>10}  {'mIoU':>10}")
+    print(f"  {'-'*38}")
+    for name, acc, miou in summary_rows:
+        acc_s  = f"{acc:.4f}"  if not np.isnan(acc)  else "n/a"
+        miou_s = f"{miou:.4f}" if not np.isnan(miou) else "n/a"
+        print(f"  {name:<14}  {acc_s:>10}  {miou_s:>10}")
 
     print("\nDone.")
     return 0
