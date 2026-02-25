@@ -167,78 +167,41 @@ def calculate_metrics(pred_labels, gt_labels):
 
 
 def run_single_benchmark(
+    bki,
     lidar_path,
     noisy_labels_raw,
     gt_labels,
-    osm_path,
-    config_path,
     noisy_labels_path
 ):
     """
-    Run a single benchmark iteration (matches osm_bki parameters).
+    Run a single benchmark iteration using a pre-constructed BKI instance.
     
     Args:
+        bki: pre-constructed PyContinuousBKI instance (will be cleared and reused)
         lidar_path: path to LiDAR data
         noisy_labels_raw: noisy labels (uint32 with upper bits)
         gt_labels: ground truth labels (semantic only)
-        osm_path: path to OSM geometries
-        config_path: path to config YAML
         noisy_labels_path: file path to save noisy labels (persistent)
         
     Returns:
         dict with 'metrics_before' and 'metrics_after'
     """
-    # Extract semantic labels from noisy data
     noisy_labels = (noisy_labels_raw & 0xFFFF).astype(np.uint32)
-    
-    # Calculate metrics BEFORE refinement
     metrics_before = calculate_metrics(noisy_labels, gt_labels)
-    
-    # Save noisy labels (persistent, not temporary)
-    noisy_labels_raw.tofile(noisy_labels_path)
-    
-    # Run refinement with parameters matching osm_bki defaults
-    # Using PyContinuousBKI directly instead of run_pipeline
-    bki = osm_bki_cpp.PyContinuousBKI(
-        osm_path=str(osm_path),
-        config_path=str(config_path),
-        resolution=1.0,     # Standard resolution
-        l_scale=3.0,        # Matches previous default
-        sigma_0=1.0,        # Matches previous default
-        prior_delta=5.0,    # Matches previous default
-        height_sigma=0.3,   # Standard default
-        use_semantic_kernel=True,
-        use_spatial_kernel=True,
-        num_threads=-1,
-        alpha0=0.01,        # Matches previous default
-        seed_osm_prior=False, # Default
-        osm_prior_strength=0.0 # Default
-    )
 
-    # Load points
+    noisy_labels_raw.tofile(noisy_labels_path)
+
+    bki.clear()
+
     points = np.fromfile(str(lidar_path), dtype=np.float32).reshape((-1, 4))[:, :3]
-    
-    # Update with noisy labels
-    # Note: noisy_labels_raw contains instance IDs in upper bits, but update expects raw labels
-    # We need to pass just the semantic part if that's what update expects?
-    # Actually PyContinuousBKI.update takes uint32 labels. 
-    # The C++ code maps raw labels to dense indices using the config.
-    # So passing the full uint32 is fine as long as the lower 16 bits match the config keys.
-    # However, usually we strip instance IDs before passing to BKI.
-    # Let's check if the C++ side handles masking. 
-    # Looking at continuous_bki.cpp: update takes raw_label and does `config_.raw_to_dense.find(raw_label)`.
-    # It does NOT mask 0xFFFF. So we MUST mask it here.
-    
     noisy_labels_semantic = (noisy_labels_raw & 0xFFFF).astype(np.uint32)
     bki.update(noisy_labels_semantic, points)
-    
-    # Infer refined labels
+
     refined_labels = bki.infer(points)
     refined_labels = np.array(refined_labels, dtype=np.uint32)
-    
-    # Calculate metrics AFTER refinement
+
     metrics_after = calculate_metrics(refined_labels, gt_labels)
-    
+
     return {
         'before': metrics_before,
         'after': metrics_after
@@ -315,6 +278,22 @@ def run_benchmark(
     
     noise_pool = VALID_CLASSES if use_kitti else MCD_CLASSES
 
+    bki = osm_bki_cpp.PyContinuousBKI(
+        osm_path=str(osm_path),
+        config_path=str(config_path),
+        resolution=1.0,
+        l_scale=3.0,
+        sigma_0=1.0,
+        prior_delta=5.0,
+        height_sigma=0.3,
+        use_semantic_kernel=True,
+        use_spatial_kernel=True,
+        num_threads=-1,
+        alpha0=0.01,
+        seed_osm_prior=False,
+        osm_prior_strength=0.0
+    )
+
     for scan_path, gt_path in pairs:
         scan_stem = scan_path.stem
         gt_raw = np.fromfile(gt_path, dtype=np.uint32)
@@ -327,11 +306,10 @@ def run_benchmark(
                 noisy_labels_path = noisy_labels_dir / f"{scan_stem}_noisy_{int(noise_level)}pct_run{run}.labels"
 
                 metrics = run_single_benchmark(
+                    bki=bki,
                     lidar_path=scan_path,
                     noisy_labels_raw=noisy_labels_raw,
                     gt_labels=gt_labels,
-                    osm_path=osm_path,
-                    config_path=config_path,
                     noisy_labels_path=noisy_labels_path
                 )
                 all_run_results.append((scan_stem, noise_level, run, metrics))

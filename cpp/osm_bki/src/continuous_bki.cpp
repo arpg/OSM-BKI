@@ -141,7 +141,9 @@ void ContinuousBKI::OSMPriorRaster::build(const ContinuousBKI& bki, float res) {
             float sum = 0.0f;
             for (int k = 0; k < K_prior; k++) {
                 float dist = bki.computeDistanceToClass(x, y, k);
-                float score = 1.0f / (1.0f + std::exp((dist / bki.delta_) - 4.6f));
+                float score = (dist <= 0.0f) ? 1.0f
+                            : (dist >= bki.delta_) ? 0.0f
+                            : 0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * dist / bki.delta_));
                 data[base + static_cast<size_t>(k)] = score;
                 sum += score;
             }
@@ -503,7 +505,9 @@ void ContinuousBKI::getOSMPrior(float x, float y, std::vector<float>& m_i) const
     // Fallback: compute on the fly (no raster built)
     for (int k = 0; k < K_prior_; k++) {
         float dist = computeDistanceToClass(x, y, k);
-        m_i[k] = 1.0f / (1.0f + std::exp((dist / delta_) - 4.6f));
+        m_i[k] = (dist <= 0.0f) ? 1.0f
+               : (dist >= delta_) ? 0.0f
+               : 0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * dist / delta_));
     }
     Eigen::Map<Eigen::VectorXf> m_i_vec(m_i.data(), K_prior_);
     float sum = m_i_vec.sum();
