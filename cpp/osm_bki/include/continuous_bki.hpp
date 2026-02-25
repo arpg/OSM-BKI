@@ -11,6 +11,7 @@
 
 #include <vector>
 #include <map>
+#include <memory>
 #include "ankerl/unordered_dense.h"
 #include <string>
 #include <cmath>
@@ -80,10 +81,38 @@ struct OSMData {
     std::map<int, std::vector<Point2D>> point_features; // class_idx -> point locations
 };
 
+// Free helper used by both OSMPriorRaster and ContinuousBKI
+float computeDistanceToClass(const OSMData& osm_data, float x, float y, int class_idx);
+
+// Precomputed 2-D prior raster for O(1) bilinear OSM lookups.
+// Extracted as a standalone, shareable struct so a single build can be
+// reused across all BKI instances that share the same OSM file, resolution,
+// and prior-delta.  Build once via OSMPriorRaster::build(), then pass the
+// resulting shared_ptr to every ContinuousBKI constructor.
+struct OSMPriorRaster {
+    std::vector<float> data;   // [height * width * K_prior] row-major
+    int width = 0, height = 0;
+    int K_prior = 0;
+    float min_x = 0, min_y = 0;
+    float cell_size = 1.0f;
+
+    // Factory: builds the raster and returns ownership.
+    // osm_data, K_prior, delta (prior bandwidth), epsilon (normalisation
+    // floor), and res (cell size in metres, should match BKI resolution)
+    // must all match the ContinuousBKI instances that will consume this raster.
+    static std::shared_ptr<OSMPriorRaster> build(
+        const OSMData& osm_data,
+        int K_prior,
+        float delta,
+        float epsilon,
+        float res);
+
+    void lookup(float x, float y, std::vector<float>& m_i) const;
+};
+
 struct Config {
     std::map<int, std::string> labels;
     std::vector<std::vector<float>> confusion_matrix; // [K_pred x K_prior]
-    std::map<int, int> label_to_matrix_idx;
     std::map<std::string, int> osm_class_map;
     std::map<int, float> height_filter_map;
     std::vector<std::string> osm_categories;
@@ -111,6 +140,9 @@ using BlockMap = ankerl::unordered_dense::map<BlockKey, Block, BlockKeyHasher>;
 // --- Main Class ---
 class ContinuousBKI {
 public:
+    // shared_raster: optional pre-built raster to share across instances.
+    // Pass nullptr (default) to build internally; pass a shared_ptr from
+    // OSMPriorRaster::build() to skip the expensive raster construction.
     ContinuousBKI(const Config& config,
                   const OSMData& osm_data,
                   float resolution = 0.1f,
@@ -124,7 +156,8 @@ public:
                   float alpha0 = 1.0f,
                   bool seed_osm_prior = false,
                   float osm_prior_strength = 0.0f,
-                  bool osm_fallback_in_infer = true);
+                  bool osm_fallback_in_infer = true,
+                  std::shared_ptr<const OSMPriorRaster> shared_raster = nullptr);
 
     // --- Templated update logic to reduce duplication ---
     template <typename ValueType>
@@ -225,22 +258,9 @@ private:
         return m;
     }
 
-    // --- Precomputed OSM prior raster ---
-    struct OSMPriorRaster {
-        std::vector<float> data;   // [height * width * K_prior] row-major
-        int width = 0, height = 0;
-        int K_prior = 0;
-        float min_x = 0, min_y = 0;
-        float cell_size = 1.0f;
-
-        void build(const ContinuousBKI& bki, float res);
-        void lookup(float x, float y, std::vector<float>& m_i) const;
-    };
-
     // --- Flat lookup tables for O(1) label mapping ---
-    std::vector<int> raw_to_dense_flat_;   // raw_label -> dense, -1 if unmapped
+    std::vector<int> raw_to_dense_flat_;   // raw_label -> dense (= matrix row), -1 if unmapped
     std::vector<int> dense_to_raw_flat_;   // dense -> raw_label, -1 if unmapped
-    std::vector<int> label_to_matrix_flat_; // raw_label -> matrix_idx, -1 if unmapped
     int max_raw_label_ = 0;
 
 private:
@@ -272,16 +292,14 @@ private:
     int K_pred_;
     int K_prior_;
 
-    // Precomputed structures
-    OSMPriorRaster osm_prior_raster_;
+    // Precomputed structures (raster may be shared across instances)
+    std::shared_ptr<const OSMPriorRaster> osm_prior_raster_;
     std::vector<float> spatial_kernel_lut_;
     float inv_l_scale_sq_;
 
     // Contiguous confusion matrix for SIMD matvec [K_pred x K_prior]
+    // K_pred == num_total_classes; dense index IS the matrix row.
     Eigen::MatrixXf confusion_matrix_;
-
-    // Reverse mapping: confusion-matrix row index -> list of dense class indices
-    std::vector<std::vector<int>> matrix_idx_to_dense_;
 };
 
 } // namespace continuous_bki

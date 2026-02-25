@@ -124,81 +124,47 @@ def calculate_metrics(pred_labels, gt_labels):
 
 
 def run_single_config(
+    bki,
     lidar_path,
     noisy_labels_path,
     gt_labels,
-    osm_path,
-    config_path,
-    use_semantic_kernel,
-    use_spatial_kernel,
     config_name
 ):
     """
-    Run BKI with specific kernel configuration.
+    Run BKI with specific kernel configuration using a pre-constructed instance.
     
     Args:
+        bki: pre-constructed PyContinuousBKI instance (will be cleared and reused)
         lidar_path: path to LiDAR data
         noisy_labels_path: path to noisy label file
         gt_labels: ground truth labels (semantic only)
-        osm_path: path to OSM geometries
-        config_path: path to config YAML
-        use_semantic_kernel: enable semantic kernel
-        use_spatial_kernel: enable spatial kernel
         config_name: descriptive name for this configuration
         
     Returns:
         dict with metrics
     """
-    # Extract noisy labels for baseline
     noisy_raw = np.fromfile(noisy_labels_path, dtype=np.uint32)
     noisy_labels = (noisy_raw & 0xFFFF).astype(np.uint32)
-    
-    # Calculate metrics BEFORE refinement
     metrics_before = calculate_metrics(noisy_labels, gt_labels)
-    
-    print(f"    Running with {config_name}...", end=" ", flush=True)
-    
-    # Run refinement with specified kernel configuration
-    # Using PyContinuousBKI directly
-    bki = osm_bki_cpp.PyContinuousBKI(
-        osm_path=str(osm_path),
-        config_path=str(config_path),
-        resolution=1.0,
-        l_scale=1.0,
-        sigma_0=1.0,
-        prior_delta=0.5,
-        height_sigma=0.3,
-        use_semantic_kernel=use_semantic_kernel,
-        use_spatial_kernel=use_spatial_kernel,
-        num_threads=-1,
-        alpha0=1,
-        seed_osm_prior=True,
-        osm_prior_strength=0.0
-    )
 
-    # Load points
+    print(f"    Running with {config_name}...", end=" ", flush=True)
+
+    bki.clear()
+
     points = np.fromfile(str(lidar_path), dtype=np.float32).reshape((-1, 4))[:, :3]
-    
-    # Load noisy labels and mask
-    noisy_raw = np.fromfile(str(noisy_labels_path), dtype=np.uint32)
     noisy_labels_semantic = (noisy_raw & 0xFFFF).astype(np.uint32)
-    
-    # Update
+
     bki.update(noisy_labels_semantic, points)
-    
-    # Infer
+
     refined_labels = bki.infer(points)
     refined_labels = np.array(refined_labels, dtype=np.uint32)
-    
-    # Calculate metrics AFTER refinement
+
     metrics_after = calculate_metrics(refined_labels, gt_labels)
-    
+
     print(f"Acc: {metrics_after['accuracy']*100:.2f}%, mIoU: {metrics_after['miou']*100:.2f}%")
-    
+
     return {
         'config_name': config_name,
-        'use_semantic': use_semantic_kernel,
-        'use_spatial': use_spatial_kernel,
         'accuracy_before': metrics_before['accuracy'],
         'miou_before': metrics_before['miou'],
         'accuracy_after': metrics_after['accuracy'],
@@ -266,13 +232,33 @@ def run_ablation_study(
     noisy_labels_dir = Path(output_csv).parent / "ablation_noisy_labels"
     noisy_labels_dir.mkdir(exist_ok=True)
     
-    # Kernel configurations to test
     configs = [
-        ("Spatial Only", False, True),      # No semantic, yes spatial
-        ("Semantic Only", True, False),     # Yes semantic, no spatial
-        ("Both Kernels", True, True)        # Yes semantic, yes spatial (full algorithm)
+        ("Spatial Only", False, True),
+        ("Semantic Only", True, False),
+        ("Both Kernels", True, True)
     ]
-    
+
+    bki_common_args = dict(
+        osm_path=str(osm_path),
+        config_path=str(config_path),
+        resolution=1.0,
+        l_scale=1.0,
+        sigma_0=1.0,
+        prior_delta=0.5,
+        height_sigma=0.3,
+        num_threads=-1,
+        alpha0=1,
+        seed_osm_prior=True,
+        osm_prior_strength=0.0
+    )
+    bki_instances = {}
+    for config_name, use_semantic, use_spatial in configs:
+        bki_instances[config_name] = osm_bki_cpp.PyContinuousBKI(
+            use_semantic_kernel=use_semantic,
+            use_spatial_kernel=use_spatial,
+            **bki_common_args
+        )
+
     results = []
     noise_pool = VALID_CLASSES if use_kitti else MCD_CLASSES
 
@@ -290,15 +276,14 @@ def run_ablation_study(
 
                 for config_name, use_semantic, use_spatial in configs:
                     result = run_single_config(
+                        bki=bki_instances[config_name],
                         lidar_path=scan_path,
                         noisy_labels_path=noisy_labels_path,
                         gt_labels=gt_labels,
-                        osm_path=osm_path,
-                        config_path=config_path,
-                        use_semantic_kernel=use_semantic,
-                        use_spatial_kernel=use_spatial,
                         config_name=config_name
                     )
+                    result['use_semantic'] = use_semantic
+                    result['use_spatial'] = use_spatial
                     result['noise_level'] = noise_level
                     result['run'] = run
                     result['scan'] = scan_stem

@@ -1,91 +1,62 @@
-# SemanticKITTI Dataset Configuration
-# Configuration for SemanticKITTI semantic segmentation
+# KITTI-360 Dataset Configuration
+#
+# Input labels must be pre-converted to the common taxonomy before calling BKI update.
 
-# Label definitions: raw_id -> label_name
+# ---------------------------------------------------------------------------
+# Common taxonomy label definitions (shared across all datasets).
+# ---------------------------------------------------------------------------
 labels:
   0: unlabeled
-  1: outlier
-  10: car
-  11: bicycle
-  13: bus
-  15: motorcycle
-  16: on-rails
-  18: truck
-  20: other-vehicle
-  30: person
-  31: bicyclist
-  32: motorcyclist
-  40: road
-  44: parking
-  48: sidewalk
-  49: other-ground
-  50: building
-  51: fence
-  52: other-structure
-  60: lane-marking
-  70: vegetation
-  71: trunk
-  72: terrain
-  80: pole
-  81: traffic-sign
-  99: other-object
-  252: moving-car
-  253: moving-bicyclist
-  254: moving-person
-  255: moving-motorcyclist
-  256: moving-on-rails
-  257: moving-bus
-  258: moving-truck
-  259: moving-other-vehicle
+  1: road
+  2: sidewalk
+  3: parking
+  4: other-ground
+  5: building
+  6: fence
+  7: pole
+  8: traffic-sign
+  9: vegetation
+  10: two-wheeler
+  11: vehicle
+  12: other-object
 
-# Confusion matrix (8x6): rows=predicted classes, cols=prior classes
-# Prior classes: [roads, parking, sidewalks, vegetation, buildings, fences]
+colors:
+  "0":  [0,   0,   0]    # unlabeled
+  "1":  [255, 0,   255]  # road
+  "2":  [244, 35,  232]  # sidewalk
+  "3":  [160, 170, 250]  # parking
+  "4":  [232, 35,  244]  # other-ground
+  "5":  [0,   100, 0]    # building
+  "6":  [153, 153, 190]  # fence
+  "7":  [153, 153, 153]  # pole
+  "8":  [0,   255, 255]  # traffic-sign
+  "9":  [35,  142, 107]  # vegetation
+  "10": [119, 11,  32]   # two-wheeler
+  "11": [51,  0,   51]   # vehicle
+  "12": [255, 255, 50]   # other-object
+
+# ---------------------------------------------------------------------------
+# Confusion matrix (13x8): rows = common taxonomy ID 0-12
+# cols = OSM prior classes:
+#   [roads, parking, sidewalks, vegetation, buildings, fences, poles, traffic_signs]
+#       0      1        2          3           4         5       6         7
+# ---------------------------------------------------------------------------
 confusion_matrix:
-  - [0.85, 0.10, 0.05, 0.00, 0.00, 0.00]  # roads
-  - [0.10, 0.85, 0.05, 0.00, 0.00, 0.00]  # parking
-  - [0.05, 0.05, 0.80, 0.05, 0.05, 0.00]  # sidewalks
-  - [0.01, 0.01, 0.05, 0.90, 0.02, 0.01]  # vegetation
-  - [0.01, 0.01, 0.02, 0.05, 0.90, 0.01]  # buildings
-  - [0.00, 0.00, 0.01, 0.05, 0.10, 0.84]  # fences
-  - [0.40, 0.40, 0.05, 0.01, 0.01, 0.00]  # vehicles
-  - [0.15, 0.15, 0.50, 0.05, 0.05, 0.05]  # other
+  - [0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00]  # 0: unlabeled    (no signal)
+  - [0.90, 0.50, 0.10, 0.01, 0.00, 0.01, 0.05, 0.05]  # 1: road
+  - [0.10, 0.30, 0.80, 0.05, 0.00, 0.05, 0.05, 0.05]  # 2: sidewalk
+  - [0.20, 0.85, 0.15, 0.01, 0.00, 0.01, 0.01, 0.01]  # 3: parking
+  - [0.15, 0.20, 0.30, 0.20, 0.00, 0.05, 0.02, 0.02]  # 4: other-ground
+  - [0.00, 0.00, 0.00, 0.05, 0.95, 0.05, 0.02, 0.02]  # 5: building
+  - [0.05, 0.05, 0.10, 0.10, 0.10, 0.85, 0.05, 0.05]  # 6: fence
+  - [0.10, 0.10, 0.15, 0.10, 0.05, 0.10, 0.85, 0.20]  # 7: pole
+  - [0.10, 0.10, 0.15, 0.05, 0.05, 0.05, 0.20, 0.85]  # 8: traffic-sign
+  - [0.20, 0.10, 0.20, 0.90, 0.15, 0.20, 0.05, 0.05]  # 9: vegetation
+  - [0.50, 0.50, 0.30, 0.05, 0.00, 0.05, 0.02, 0.02]  # 10: two-wheeler
+  - [0.75, 0.70, 0.15, 0.02, 0.00, 0.02, 0.02, 0.02]  # 11: vehicle
+  - [0.10, 0.10, 0.10, 0.10, 0.05, 0.10, 0.10, 0.10]  # 12: other-object
 
-# Mapping from raw label ID to confusion matrix row index
-label_to_matrix_idx:
-  40: 0   # road -> roads
-  60: 0   # lane-marking -> roads
-  44: 1   # parking -> parking
-  48: 2   # sidewalk -> sidewalks
-  49: 2   # other-ground -> sidewalks
-  72: 2   # terrain -> sidewalks
-  70: 3   # vegetation -> vegetation
-  71: 3   # trunk -> vegetation
-  50: 4   # building -> buildings
-  52: 4   # other-structure -> buildings
-  51: 5   # fence -> fences
-  10: 6   # car -> vehicles
-  11: 6   # bicycle -> vehicles
-  13: 6   # bus -> vehicles
-  15: 6   # motorcycle -> vehicles
-  16: 6   # on-rails -> vehicles
-  18: 6   # truck -> vehicles
-  20: 6   # other-vehicle -> vehicles
-  252: 6  # moving-car -> vehicles
-  253: 6  # moving-bicyclist -> vehicles
-  254: 6  # moving-person -> vehicles
-  255: 6  # moving-motorcyclist -> vehicles
-  256: 6  # moving-on-rails -> vehicles
-  257: 6  # moving-bus -> vehicles
-  258: 6  # moving-truck -> vehicles
-  259: 6  # moving-other-vehicle -> vehicles
-  30: 7   # person -> other
-  31: 7   # bicyclist -> other
-  32: 7   # motorcyclist -> other
-  80: 7   # pole -> other
-  81: 7   # traffic-sign -> other
-  99: 7   # other-object -> other
-
-# OSM category mapping to prior class indices
+# OSM category mapping to prior class column indices
 osm_class_map:
   roads: 0
   parking: 1
@@ -95,11 +66,27 @@ osm_class_map:
   wood: 3
   buildings: 4
   fences: 5
+  barriers: 5
+  poles: 6
+  traffic_signs: 7
 
-# OSM categories in binary file order
+# GPS reference for Mercator projection of OSM features into the LiDAR world frame.
+# If omitted, the parser falls back to the <bounds> centroid in the OSM file,
+# which may be wrong if the OSM extract covers a different region.
+# These coordinates are for KITTI-360 sequence 0009 (Karlsruhe).
+osm_origin_lat: 48.985
+osm_origin_lon: 8.39295
+
+# OSM categories (for binary file loading order)
 osm_categories:
   - buildings
   - roads
+  - sidewalks
+  - parking
   - grasslands
   - trees
   - wood
+  - fences
+  - poles
+  - traffic_signs
+  - barriers

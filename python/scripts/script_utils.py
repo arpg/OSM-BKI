@@ -303,6 +303,59 @@ def transform_points_to_world(points, pose, body_to_lidar, init_rel_pos=None):
     )
 
 
+def load_poses_mat4(pose_path: str) -> dict:
+    """
+    Load KITTI-360 style velodyne_poses.txt.
+
+    Each non-comment line contains a frame index followed by 12 values (row-major
+    3×4 LiDAR-to-world matrix) or 16 values (4×4).  Example::
+
+        0 r00 r01 r02 tx  r10 r11 r12 ty  r20 r21 r22 tz
+
+    Returns {frame_id: np.ndarray(4, 4)} where the last row is padded to
+    [0, 0, 0, 1] for 3×4 inputs.
+    """
+    poses: dict = {}
+    with open(pose_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            sep = ',' if ',' in line else None
+            vals = []
+            for tok in (line.split(sep) if sep else line.split()):
+                try:
+                    vals.append(float(tok))
+                except ValueError:
+                    pass
+            if len(vals) == 13:
+                # frame_index + 12 values -> 3x4 matrix
+                frame_id = int(vals[0])
+                mat = np.array(vals[1:13], dtype=np.float64).reshape(3, 4)
+                T = np.eye(4, dtype=np.float64)
+                T[:3, :] = mat
+                poses[frame_id] = T
+            elif len(vals) == 17:
+                # frame_index + 16 values -> 4x4 matrix
+                frame_id = int(vals[0])
+                poses[frame_id] = np.array(vals[1:17], dtype=np.float64).reshape(4, 4)
+            else:
+                continue
+    return poses
+
+
+def transform_points_to_world_mat4(points, pose_mat4, init_rel_pos=None):
+    """Delegate to C++ transform_scan_to_world_mat4 (pose_utils.hpp)."""
+    if osm_bki_cpp is None:
+        raise ImportError(
+            "osm_bki_cpp not available. Build the C++ extension.")
+    return osm_bki_cpp.transform_scan_to_world_mat4(
+        np.ascontiguousarray(points, dtype=np.float32),
+        np.ascontiguousarray(pose_mat4, dtype=np.float64),
+        np.asarray(init_rel_pos, dtype=np.float64) if init_rel_pos is not None else None,
+    )
+
+
 def load_scan(bin_path):
     """Load point cloud (N,4) float32 and return (N,3) xyz, (N,) intensity."""
     scan = np.fromfile(bin_path, dtype=np.float32).reshape(-1, 4)

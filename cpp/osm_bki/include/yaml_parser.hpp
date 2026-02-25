@@ -17,7 +17,6 @@ public:
     std::map<std::string, std::string> scalars;
     std::map<std::string, std::map<int, std::string>> int_maps;  // For labels
     std::map<std::string, std::map<std::string, int>> str_maps;   // For osm_class_map
-    std::map<std::string, std::map<int, int>> int_int_maps;       // For label_to_matrix_idx
     std::map<std::string, std::map<std::string, float>> str_float_maps; // For osm_height_filter
     std::map<std::string, std::vector<std::vector<float>>> matrices;
     std::map<std::string, std::vector<std::string>> str_lists;    // For osm_categories
@@ -120,8 +119,6 @@ public:
                             int int_key = std::stoi(key);
                             if (current_key == "labels") {
                                 int_maps[current_key][int_key] = value;
-                            } else if (current_key == "label_to_matrix_idx") {
-                                int_int_maps[current_key][int_key] = std::stoi(value);
                             }
                         } catch (...) {
                             // String key
@@ -150,11 +147,6 @@ public:
     std::vector<std::vector<float>> getConfusionMatrix() const {
         auto it = matrices.find("confusion_matrix");
         return (it != matrices.end()) ? it->second : std::vector<std::vector<float>>();
-    }
-
-    std::map<int, int> getLabelToMatrixIdx() const {
-        auto it = int_int_maps.find("label_to_matrix_idx");
-        return (it != int_int_maps.end()) ? it->second : std::map<int, int>();
     }
 
     std::map<std::string, int> getOSMClassMap() const {

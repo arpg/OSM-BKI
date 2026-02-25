@@ -359,7 +359,6 @@ Config loadConfigFromYAML(const std::string& config_path) {
 
         config.labels = yaml.getLabels();
         config.confusion_matrix = yaml.getConfusionMatrix();
-        config.label_to_matrix_idx = yaml.getLabelToMatrixIdx();
         config.osm_class_map = yaml.getOSMClassMap();
         config.osm_categories = yaml.getOSMCategories();
 

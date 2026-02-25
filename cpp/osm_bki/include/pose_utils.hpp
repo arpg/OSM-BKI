@@ -129,4 +129,27 @@ inline std::vector<Point3D> transformScanToWorld(
     return out;
 }
 
+// -- Matrix-pose variant: lidar_to_world given directly (no quat conversion) --
+//
+// Use this for datasets like KITTI-360 whose pose files already express the
+// LiDAR-to-world transform as a 3x4 / 4x4 matrix, so no body_to_lidar step
+// is required.
+
+inline std::vector<Point3D> transformScanToWorldMat4(
+    const std::vector<Point3D>& points,
+    const Transform4x4& lidar_to_world,
+    const double* init_rel_pos = nullptr)
+{
+    Transform4x4 T = lidar_to_world;
+    if (init_rel_pos) {
+        T.m[3]  -= init_rel_pos[0];
+        T.m[7]  -= init_rel_pos[1];
+        T.m[11] -= init_rel_pos[2];
+    }
+    std::vector<Point3D> out(points.size());
+    for (size_t i = 0; i < points.size(); ++i)
+        out[i] = transformPoint(T, points[i]);
+    return out;
+}
+
 }  // namespace continuous_bki

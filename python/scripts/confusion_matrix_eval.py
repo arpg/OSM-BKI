@@ -9,7 +9,6 @@ Usage (matches run_cmd.sh parameters):
     python python/scripts/confusion_matrix_eval.py \\
         --config cpp/osm_bki/configs/mcd_config.yaml \\
         --osm example_data/kth.osm \\
-        --calib example_data/hhs_calib.yaml \\
         --scan-dir /path/to/lidar_bin/data/ \\
         --label-dir /path/to/inferred_labels/ \\
         --gt-dir /path/to/gt_labels/ \\
@@ -34,9 +33,14 @@ from sklearn.metrics import confusion_matrix as sklearn_confusion_matrix
 
 import osm_bki_cpp
 
-from script_utils import ConfigReader, (
+from script_utils import (
+    ConfigReader,
     load_body_to_lidar, load_poses_csv, transform_points_to_world,
     load_scan, load_labels, find_label_file, get_frame_number,
+)
+from label_utils import (
+    detect_dataset, build_to_common_lut, apply_common_lut,
+    COMMON_LABELS, IGNORE_LABELS, N_COMMON,
 )
 
 
@@ -99,7 +103,9 @@ def main():
     )
     parser.add_argument("--config", required=True, help="Path to YAML config (e.g. mcd_config.yaml)")
     parser.add_argument("--osm", required=True, help="Path to OSM geometries (.bin or .osm)")
-    parser.add_argument("--calib", required=True, help="Path to hhs_calib.yaml (body→LiDAR)")
+    parser.add_argument("--calib", default=None,
+                        help="Path to body→LiDAR calibration YAML. "
+                             "If omitted, an identity transform is used.")
     parser.add_argument("--scan-dir", required=True, help="Directory of .bin scans")
     parser.add_argument("--label-dir", required=True, help="Directory of predicted labels (.label/.bin)")
     parser.add_argument("--gt-dir", required=True, help="Directory of ground-truth labels")
@@ -125,6 +131,10 @@ def main():
                         help="Output figure path (e.g. confusion_matrix.png)")
     parser.add_argument("--normalize", choices=['true', 'pred'], default=None,
                         help="Normalize matrix: 'true' by GT rows, 'pred' by pred cols")
+    parser.add_argument("--dataset-pred-type", choices=["mcd", "semkitti", "kitti360"], default=None,
+                        help="Dataset type for prediction labels (overrides autodetect)")
+    parser.add_argument("--dataset-gt-type", choices=["mcd", "semkitti", "kitti360"], default=None,
+                        help="Dataset type for GT labels (overrides autodetect)")
     args = parser.parse_args()
 
     scan_dir = Path(args.scan_dir)
@@ -182,8 +192,36 @@ def main():
 
     print(f"Scans: {n_total} total, train: {len(train_files)}, test: {len(test_files)}")
 
+    # --- Autodetect dataset type for pred and GT labels, build common-taxonomy LUTs ---
+    _first_pred = find_label_file(label_dir, scan_files[0].stem)
+    if _first_pred:
+        pred_dataset = args.dataset_pred_type or detect_dataset(load_labels(_first_pred))
+    else:
+        pred_dataset = args.dataset_pred_type or "mcd"
+        print(f"WARNING: Could not find pred label file for autodetect; using '{pred_dataset}'.",
+              file=sys.stderr)
+    pred_lut = build_to_common_lut(pred_dataset)
+    print(f"Prediction labels: dataset={pred_dataset}")
+
+    _first_gt = find_label_file(gt_dir, scan_files[0].stem)
+    if _first_gt:
+        gt_dataset = args.dataset_gt_type or detect_dataset(load_labels(_first_gt))
+    else:
+        gt_dataset = args.dataset_gt_type or pred_dataset
+        print(f"WARNING: Could not find GT label file for autodetect; using '{gt_dataset}'.",
+              file=sys.stderr)
+    gt_lut = build_to_common_lut(gt_dataset)
+    print(f"GT labels:         dataset={gt_dataset}")
+
     poses = load_poses_csv(args.pose)
-    body_to_lidar = load_body_to_lidar(args.calib)
+    if args.calib:
+        if not os.path.exists(args.calib):
+            print(f"ERROR: Calibration file not found: {args.calib}", file=sys.stderr)
+            return 1
+        body_to_lidar = load_body_to_lidar(args.calib)
+    else:
+        body_to_lidar = np.eye(4, dtype=np.float64)
+        print("No --calib provided; using identity body→LiDAR transform.")
     init_rel_pos = np.array(args.init_rel_pos, dtype=np.float64) if args.init_rel_pos else None
 
     # Train BKI
@@ -216,7 +254,8 @@ def main():
         if frame is not None and frame in poses:
             points_xyz = transform_points_to_world(
                 points_xyz, poses[frame], body_to_lidar, init_rel_pos)
-        bki.update(labels, points_xyz)
+        labels_common = apply_common_lut(labels, pred_lut).astype(np.uint32)
+        bki.update(labels_common, points_xyz)
 
     print(f"Trained on {len(train_files)} scans. Map size: {bki.get_size()} voxels")
 
@@ -231,11 +270,12 @@ def main():
         if not gt_path:
             continue
         points_xyz, _ = load_scan(str(scan_path))
-        gt = load_labels(gt_path)
+        gt_raw = load_labels(gt_path)
         if frame is not None and frame in poses:
             points_xyz = transform_points_to_world(
                 points_xyz, poses[frame], body_to_lidar, init_rel_pos)
-        pred = bki.infer(points_xyz)
+        pred = bki.infer(points_xyz)  # already in common space
+        gt = apply_common_lut(gt_raw, gt_lut).astype(np.uint32)
         n = min(len(pred), len(gt))
         if n > 0:
             all_pred.append(pred[:n])
@@ -249,21 +289,18 @@ def main():
     pred_flat = np.concatenate(all_pred)
     gt_flat = np.concatenate(all_gt)
 
-    # Determine class set: union of pred and gt (optionally filter ignore)
-    ignore_label = 0
-    mask = gt_flat != ignore_label
+    # Use fixed common taxonomy class set (exclude ignored labels)
+    all_classes = [c for c in range(N_COMMON) if c not in IGNORE_LABELS]
+    class_names = [COMMON_LABELS[c] for c in all_classes]
+
+    mask = ~np.isin(gt_flat, IGNORE_LABELS)
     pred_m = pred_flat[mask]
     gt_m = gt_flat[mask]
-    all_classes = sorted(set(np.unique(pred_m).tolist()) | set(np.unique(gt_m).tolist()))
-    if not all_classes:
+    if len(gt_m) == 0:
         print("ERROR: No valid (non-ignored) points for confusion matrix.", file=sys.stderr)
         return 1
 
     cm = sklearn_confusion_matrix(gt_m, pred_m, labels=all_classes)
-
-    # Load label names
-    label_names = ConfigReader(args.config).label_names
-    class_names = [label_names.get(c, str(c)) for c in all_classes]
 
     # Plot
     output_path = args.output or "confusion_matrix.png"
